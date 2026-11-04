@@ -1,0 +1,99 @@
+mod create;
+mod delete;
+// `pub(crate)`, not the default private `mod`, so `crate::error::mod`'s special-casing of
+// `RoverClientError::PairListFailure` can reach `list::output`'s `keys_table_text`/`keys_json`.
+pub(crate) mod list;
+mod pair_lookup;
+mod rename;
+mod rotate;
+
+use std::fmt::{Display, Formatter};
+
+use clap::{Parser, ValueEnum};
+use serde::Serialize;
+
+use crate::{
+    RoverOutput, RoverResult,
+    command::api_key::{
+        create::Create, delete::Delete, list::List, rename::Rename, rotate::Rotate,
+    },
+    options::ProfileOpt,
+    utils::client::StudioClientConfig,
+};
+
+#[derive(Debug, Serialize, Parser)]
+pub struct ApiKeys {
+    #[clap(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Serialize, Parser)]
+pub enum Command {
+    #[clap(name = "create", about = "Create a new API key")]
+    Create(Create),
+    #[clap(name = "delete", about = "Delete an existing API key")]
+    Delete(Delete),
+    #[clap(name = "list", about = "List all API keys for an organization")]
+    List(List),
+    #[clap(name = "rename", about = "Rename an existing API key")]
+    Rename(Rename),
+    #[clap(
+        name = "rotate",
+        about = "Rotate an existing client-credential pair's secret"
+    )]
+    Rotate(Rotate),
+}
+
+impl ApiKeys {
+    pub async fn run(
+        &self,
+        client_config: StudioClientConfig,
+        profile: &ProfileOpt,
+    ) -> RoverResult<RoverOutput> {
+        match &self.command {
+            Command::Create(command) => command.run(client_config, profile).await,
+            Command::Delete(command) => command.run(client_config, profile).await,
+            Command::List(command) => command.run(client_config, profile).await,
+            Command::Rename(command) => command.run(client_config, profile).await,
+            Command::Rotate(command) => command.run(client_config, profile).await,
+        }
+    }
+}
+
+// We define a new enum here so that we can keep the implementation details of the actual graph
+// enum contained within this crate rather than leaking it out. Further it allows us to selectively
+// add support for more key types as they are required, rather than them changing as the schema
+// does.
+#[derive(Debug, Clone, Serialize, ValueEnum, Copy, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ApiKeyType {
+    Operator,
+    Subgraph,
+    /// A pair of credentials for the OAuth 2.0 client-credentials grant
+    // A fully separate GraphQL mutation (`createOAuthClient`) from the other two, which share
+    // `createApiKey`/`GraphOsKeyType` - `create::Create::run` dispatches on this variant before
+    // ever building a `GraphOsKeyType`.
+    ClientCredentials,
+}
+
+impl Display for ApiKeyType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiKeyType::Operator => write!(f, "Operator"),
+            ApiKeyType::Subgraph => write!(f, "Subgraph"),
+            ApiKeyType::ClientCredentials => write!(f, "ClientCredentials"),
+        }
+    }
+}
+
+#[derive(Debug, Parser, Serialize)]
+pub struct OrganizationOpt {
+    #[clap(help = "The ID of the Organization")]
+    organization_id: String,
+}
+
+#[derive(Debug, Parser, Serialize)]
+pub struct IdOpt {
+    #[clap(help = "The ID of the API key")]
+    id: String,
+}

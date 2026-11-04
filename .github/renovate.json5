@@ -1,0 +1,37 @@
+{
+  extends: [
+    "github>Turbo87/renovate-config//rust/updateToolchain",
+    ":automergeStableNonMajor"
+  ],
+  ignorePaths: [".github/workflows/issue-triage.lock.yml"],
+  platformAutomerge: true,
+  packageRules: [
+    {
+      matchPackageNames: ["apollographql/federation-rs"],
+      extractVersion: "^supergraph@(?<version>v\\d+\\.\\d+\\.\\d+)$",
+      automerge: false,
+    },
+    {
+      matchPackageNames: ["apollographql/router"],
+      automerge: false,
+    },
+    {
+      matchPackageNames: ["apollographql/router"],
+      matchCurrentValue: "v1.*",
+      allowedVersions: ">=1.0.0 <2.0.0",
+      versioning: "semver",
+    },
+    {
+      matchPackageNames: ["apollographql/router"],
+      matchCurrentValue: "v2.*",
+      allowedVersions: ">=2.0.0 <3.0.0",
+      versioning: "semver",
+    },
+  ],
+  vulnerabilityAlerts: {
+    enabled: true,
+  },
+  lockFileMaintenance: {
+    enabled: true,
+  },
+}

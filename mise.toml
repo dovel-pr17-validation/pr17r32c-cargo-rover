@@ -1,0 +1,62 @@
+[settings]
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+# Installed first so the `cargo:` tools below are fetched as prebuilt binaries
+# (mise's `cargo.binstall` setting) instead of compiled from source, which took
+# 5-13 minutes in every CI job that sets up mise.
+"aqua:cargo-bins/cargo-binstall" = "1.26.2"
+"cargo:lychee" = "0.24.2"
+node = "24.22.1"
+"npm:npm" = "12.2.1"
+"cargo:cargo-deny" = "0.20"
+"cargo:graphql_client_cli" = "0.16.0"
+"cargo:cargo-npm" = "0.1.4"
+
+[tasks.check]
+description = "Run the same checks as CI"
+depends = ["clippy", "format-check", "test"]
+
+[tasks.add-changeset]
+description = "Add a changeset describing a user-visible change (see .changeset/README.md)"
+run = "cargo xtask changeset add"
+
+[tasks.check-changeset]
+description = "Check the changesets this branch adds (usage: mise run check-changeset -- --base <branch>)"
+run = "cargo xtask changeset check"
+
+[tasks.prep]
+description = "Prepare a release: regenerate template schemas/queries and bump the npm installer version"
+run = "cargo xtask prep"
+
+[tasks.format-check]
+run = "cargo +nightly fmt --all -- --check"
+
+[tasks.clippy]
+run = "cargo clippy --locked --workspace --all-features --all-targets"
+
+[tasks.test]
+run = "cargo test --locked --workspace --exclude regressions"
+
+[tasks.generate-npm]
+description = "Generate npm packages via cargo-npm and patch the shim"
+run = """
+cargo npm generate
+node .mise/scripts/patch-npm-shim.js
+"""
+
+[tasks.install_npm]
+run = "bash .mise/scripts/install_npm.sh"
+
+[tasks.install_npm_global]
+run = "bash .mise/scripts/install_npm_global.sh"
+
+[tasks.install_pnpm]
+run = "bash .mise/scripts/install_pnpm.sh"
+
+[tasks.cargo-deny]
+run = "cargo deny check"
+
+[tasks.coverage]
+description = "Check test coverage for the crate/module you're working on (pass extra args after --)"
+run = "mise x cargo:cargo-tarpaulin@0.31 -- cargo tarpaulin"

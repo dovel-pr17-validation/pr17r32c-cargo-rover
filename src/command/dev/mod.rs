@@ -1,0 +1,265 @@
+#![warn(missing_docs)]
+
+use apollo_federation_types::config::FederationVersion;
+use camino::Utf8PathBuf;
+
+#[cfg(feature = "composition-js")]
+mod do_dev;
+#[cfg(feature = "composition-js")]
+mod mcp;
+#[cfg(not(feature = "composition-js"))]
+mod no_dev;
+#[cfg(feature = "composition-js")]
+mod router;
+
+use std::{net::IpAddr, str::FromStr};
+
+use clap::Parser;
+use derive_getters::Getters;
+use rover_studio::types::GraphRef;
+use serde::Serialize;
+
+use crate::{
+    options::{OptionalSubgraphOpts, PluginOpts},
+    utils::parsers::FileDescriptorType,
+};
+
+#[derive(Debug, Serialize, Parser)]
+/// Command that represents running a local router, and composition to test local changes to
+/// subgraphs.
+pub struct Dev {
+    #[clap(flatten)]
+    pub(crate) opts: DevOpts,
+}
+
+#[derive(Debug, Serialize, Parser)]
+pub struct DevOpts {
+    #[clap(flatten)]
+    pub plugin_opts: PluginOpts,
+
+    #[clap(flatten)]
+    pub subgraph_opts: OptionalSubgraphOpts,
+
+    #[clap(flatten)]
+    pub supergraph_opts: SupergraphOpts,
+
+    #[cfg(feature = "composition-js")]
+    #[clap(flatten)]
+    pub mcp: mcp::Opts,
+}
+
+#[derive(Debug, Parser, Serialize, Clone, Getters)]
+pub struct SupergraphOpts {
+    /// The port the graph router should listen on.
+    ///
+    /// If you start multiple `rover dev` processes on the same address and port, they will communicate with each other.
+    ///
+    /// If you start multiple `rover dev` processes with different addresses and ports, they will not communicate with each other.
+    #[arg(long, short = 'p')]
+    supergraph_port: Option<u16>,
+
+    /// The address the graph router should listen on.
+    ///
+    /// If you start multiple `rover dev` processes on the same address and port, they will communicate with each other.
+    ///
+    /// If you start multiple `rover dev` processes with different addresses and ports, they will not communicate with each other.
+    #[arg(long)]
+    supergraph_address: Option<IpAddr>,
+
+    /// The path to a router configuration file. If the file path is empty, a default configuration will be written to that file. This file is then watched for changes and propagated to the router.
+    ///
+    /// For information on the format of this file, please see https://www.apollographql.com/docs/router/configuration/overview/#yaml-config-file.
+    #[arg(long = "router-config")]
+    #[serde(skip_serializing)]
+    router_config_path: Option<Utf8PathBuf>,
+
+    /// The path to a supergraph configuration file. If provided, subgraphs will be loaded from this
+    /// file.
+    ///
+    /// Cannot be used with `--url`, `--name`, or `--schema`.
+    ///
+    /// For information on the format of this file, please see https://www.apollographql.com/docs/rover/commands/supergraphs/#yaml-configuration-file.
+    #[arg(
+        long = "supergraph-config",
+        conflicts_with_all = ["subgraph_name", "subgraph_url", "subgraph_schema_path"]
+    )]
+    supergraph_config_path: Option<FileDescriptorType>,
+
+    /// A [`GraphRef`] that is accessible in Apollo Studio.
+    /// This is used to initialize your supergraph with the values contained in this variant.
+    ///
+    /// This is analogous to providing a supergraph.yaml file with references to your graph variant in studio.
+    ///
+    /// If used in conjunction with `--supergraph-config`, the values presented in the supergraph.yaml will take precedence over these values.
+    #[arg(long = "graph-ref")]
+    graph_ref: Option<GraphRef>,
+
+    /// The version of Apollo Federation to use for composition
+    #[arg(long = "federation-version", value_parser = crate::federation::parse_federation_version)]
+    federation_version: Option<FederationVersion>,
+
+    /// The path to an offline enterprise license file.
+    ///
+    /// For more information, please see https://www.apollographql.com/docs/router/enterprise-features/#offline-enterprise-license
+    #[arg(long)]
+    license: Option<Utf8PathBuf>,
+
+    /// Path to write the composed supergraph schema to, (re)writing it on every successful composition.
+    #[arg(long = "supergraph-output")]
+    supergraph_output: Option<Utf8PathBuf>,
+
+    /// The version of the GraphOS Router to use.
+    ///
+    /// You can also use the `APOLLO_ROVER_DEV_ROUTER_VERSION` environment variable.
+    #[arg(long = "router-version", env = "APOLLO_ROVER_DEV_ROUTER_VERSION")]
+    pub(crate) router_version: Option<String>,
+
+    /// The version of Apollo Federation to use for composition.
+    ///
+    /// You can also use the `APOLLO_ROVER_DEV_COMPOSITION_VERSION` environment
+    /// variable. `--federation-version` takes precedence over both.
+    // this number should be mapped to the federation version used by the router
+    // https://www.apollographql.com/docs/router/federation-version-support/#support-table
+    #[arg(
+        long = "composition-version",
+        env = "APOLLO_ROVER_DEV_COMPOSITION_VERSION",
+        value_parser = parse_composition_version
+    )]
+    pub(crate) composition_version: Option<String>,
+}
+
+/// Checks a `--composition-version` (or `APOLLO_ROVER_DEV_COMPOSITION_VERSION`) value when the
+/// command line is parsed, so a bad one fails the command before anything starts.
+///
+/// The value is an exact version like `2.9.0`, written without a leading `=`: `rover dev` adds
+/// the `=` that `supergraph.yaml` and `--federation-version` use when it builds the federation
+/// version from it. A value that already starts with one is rejected, because it would become
+/// the invalid `==2.9.0`.
+fn parse_composition_version(input: &str) -> Result<String, String> {
+    FederationVersion::from_str(&format!("={input}"))
+        .map(|_| input.to_string())
+        .map_err(|_| {
+            format!(
+                "`{input}` is not a supported composition version. Use an exact version, such as `2.9.0`, with no leading `=`"
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+    use clap::Parser;
+    use speculoos::prelude::*;
+
+    use super::DevOpts;
+
+    /// `args` parsed with none of the environment variables other tests here
+    /// set, which clap would otherwise read while one of them has it set.
+    fn parse_without_env(args: &[&str]) -> Result<DevOpts, clap::Error> {
+        temp_env::with_vars_unset(
+            [
+                "APOLLO_ROVER_DEV_COMPOSITION_VERSION",
+                "APOLLO_ROVER_DEV_ROUTER_VERSION",
+            ],
+            || DevOpts::try_parse_from(args),
+        )
+    }
+
+    #[test]
+    fn supergraph_output_flag_parses_into_supergraph_opts() {
+        let opts =
+            parse_without_env(&["dev", "--supergraph-output", "build/supergraph.graphql"]).unwrap();
+        assert_eq!(
+            opts.supergraph_opts.supergraph_output,
+            Some(Utf8PathBuf::from("build/supergraph.graphql"))
+        );
+    }
+
+    #[test]
+    fn supergraph_output_defaults_to_none() {
+        let opts = parse_without_env(&["dev"]).unwrap();
+        assert_eq!(opts.supergraph_opts.supergraph_output, None);
+    }
+
+    #[test]
+    fn router_version_flag_wins_over_env_var() {
+        let opts = temp_env::with_var("APOLLO_ROVER_DEV_ROUTER_VERSION", Some("1.2.3"), || {
+            DevOpts::try_parse_from(["dev", "--router-version", "4.5.6"])
+        })
+        .unwrap();
+        assert_that!(opts.supergraph_opts.router_version).is_equal_to(Some("4.5.6".to_string()));
+    }
+
+    #[test]
+    fn router_version_env_var_applies_alone() {
+        let opts = temp_env::with_var("APOLLO_ROVER_DEV_ROUTER_VERSION", Some("1.2.3"), || {
+            DevOpts::try_parse_from(["dev"])
+        })
+        .unwrap();
+        assert_that!(opts.supergraph_opts.router_version).is_equal_to(Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn composition_version_flag_wins_over_env_var() {
+        let opts = temp_env::with_var(
+            "APOLLO_ROVER_DEV_COMPOSITION_VERSION",
+            Some("2.7.0"),
+            || DevOpts::try_parse_from(["dev", "--composition-version", "2.9.0"]),
+        )
+        .unwrap();
+        assert_that!(opts.supergraph_opts.composition_version)
+            .is_equal_to(Some("2.9.0".to_string()));
+    }
+
+    #[test]
+    fn composition_version_env_var_applies_alone() {
+        let opts = temp_env::with_var(
+            "APOLLO_ROVER_DEV_COMPOSITION_VERSION",
+            Some("2.7.0"),
+            || DevOpts::try_parse_from(["dev"]),
+        )
+        .unwrap();
+        assert_that!(opts.supergraph_opts.composition_version)
+            .is_equal_to(Some("2.7.0".to_string()));
+    }
+
+    // An invalid version fails the command when it is parsed, from the flag or from the
+    // environment, instead of being reported and then ignored once `rover dev` has started.
+    #[rstest::rstest]
+    #[case::leading_equals("=2.15.2")]
+    #[case::bare_major("2")]
+    #[case::major_minor("2.9")]
+    #[case::not_a_version("banana")]
+    #[case::empty("")]
+    fn an_invalid_composition_version_fails_the_flag(#[case] version: &str) {
+        let error =
+            temp_env::with_var("APOLLO_ROVER_DEV_COMPOSITION_VERSION", None::<&str>, || {
+                DevOpts::try_parse_from(["dev", "--composition-version", version])
+            })
+            .unwrap_err();
+
+        assert_that!(error.to_string().contains(&format!(
+            "`{version}` is not a supported composition version. Use an exact version, such as `2.9.0`, with no leading `=`"
+        )))
+        .named(&error.to_string())
+        .is_true();
+    }
+
+    #[test]
+    fn an_invalid_composition_version_fails_the_environment_variable() {
+        let error = temp_env::with_var(
+            "APOLLO_ROVER_DEV_COMPOSITION_VERSION",
+            Some("=2.15.2"),
+            || DevOpts::try_parse_from(["dev"]),
+        )
+        .unwrap_err();
+
+        assert_that!(
+            error
+                .to_string()
+                .contains("is not a supported composition version")
+        )
+        .named(&error.to_string())
+        .is_true();
+    }
+}

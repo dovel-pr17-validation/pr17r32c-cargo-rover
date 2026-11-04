@@ -1,0 +1,91 @@
+use clap::Parser;
+use rover_client::{
+    operations::subgraph::{
+        check::{self, SubgraphCheckAsyncInput},
+        check_workflow::{self, CheckWorkflowInput},
+    },
+    shared::{CheckConfig, GitContext},
+};
+use rover_std::Style;
+use serde::Serialize;
+
+use crate::{
+    RoverOutput, RoverResult,
+    options::{CheckConfigOpts, GraphRefOpt, ProfileOpt, SchemaOpt, SubgraphOpt},
+    utils::client::StudioClientConfig,
+};
+
+#[derive(Debug, Serialize, Parser)]
+pub struct Check {
+    #[clap(flatten)]
+    graph: GraphRefOpt,
+
+    #[clap(flatten)]
+    subgraph: SubgraphOpt,
+
+    #[clap(flatten)]
+    #[serde(skip_serializing)]
+    schema: SchemaOpt,
+
+    #[clap(flatten)]
+    config: CheckConfigOpts,
+
+    /// If the check should be run asynchronously and exit without waiting for check results
+    #[arg(long)]
+    background: bool,
+}
+
+impl Check {
+    pub async fn run(
+        &self,
+        client_config: StudioClientConfig,
+        git_context: GitContext,
+        checks_timeout_seconds: u64,
+        profile: &ProfileOpt,
+    ) -> RoverResult<RoverOutput> {
+        let client = client_config.get_authenticated_client(profile)?;
+
+        let proposed_schema = self
+            .schema
+            .read_file_descriptor("SDL", &mut std::io::stdin())?;
+
+        eprintln!(
+            "Checking the proposed schema for subgraph {} against {}",
+            self.subgraph.subgraph_name,
+            Style::Link.paint(self.graph.graph_ref.to_string())
+        );
+
+        let workflow_res = check::run(
+            SubgraphCheckAsyncInput {
+                graph_ref: self.graph.graph_ref.clone(),
+                subgraph: self.subgraph.subgraph_name.clone(),
+                git_context,
+                proposed_schema,
+                config: CheckConfig {
+                    query_count_threshold: self.config.query_count_threshold,
+                    query_count_threshold_percentage: self.config.query_percentage_threshold,
+                    validation_period: self.config.validation_period.clone(),
+                },
+            },
+            &client,
+        )
+        .await?;
+        if self.background {
+            Ok(RoverOutput::AsyncCheckResponse(workflow_res))
+        } else {
+            let check_res = check_workflow::run(
+                CheckWorkflowInput {
+                    graph_ref: self.graph.graph_ref.clone(),
+                    workflow_id: workflow_res.workflow_id,
+                    checks_timeout_seconds,
+                    include_contract_checks: self.config.include_contract_checks,
+                },
+                self.subgraph.subgraph_name.clone(),
+                &client,
+            )
+            .await?;
+
+            Ok(RoverOutput::CheckWorkflowResponse(check_res))
+        }
+    }
+}

@@ -1,0 +1,38 @@
+mod check;
+mod compose;
+mod file_discovery;
+mod graph;
+mod introspect;
+mod license;
+mod lint;
+mod oauth;
+mod output;
+mod persisted_queries;
+mod profile;
+mod project_settings;
+mod settings;
+
+mod schema;
+mod subgraph;
+pub(crate) mod template;
+mod templates_api;
+
+pub(crate) use check::*;
+pub(crate) use compose::*;
+pub(crate) use file_discovery::*;
+pub(crate) use graph::*;
+pub(crate) use introspect::*;
+pub(crate) use license::*;
+pub(crate) use lint::*;
+pub(crate) use oauth::*;
+pub(crate) use output::*;
+pub(crate) use persisted_queries::*;
+pub(crate) use profile::*;
+pub(crate) use project_settings::*;
+pub(crate) use schema::*;
+// Unused until the settings-resolution slice consumes it - see settings.rs.
+#[allow(unused_imports)]
+pub(crate) use settings::*;
+pub(crate) use subgraph::*;
+pub(crate) use template::*;
+pub(crate) use templates_api::*;

@@ -1,0 +1,910 @@
+mod metadata;
+
+pub use metadata::{RoverErrorCode, RoverErrorMetadata, RoverErrorSuggestion};
+
+pub type RoverResult<T> = std::result::Result<T, RoverError>;
+
+use std::{
+    borrow::BorrowMut,
+    error::Error,
+    fmt::{self, Debug, Display},
+};
+
+use apollo_federation_types::rover::BuildErrors;
+use calm_io::{stderr, stdoutln};
+use http::StatusCode;
+use rover_client::RoverClientError;
+use rover_http::HttpServiceError;
+use rover_std::Style;
+use serde::{Serialize, Serializer, ser::SerializeStruct};
+use serde_json::{Value, json};
+use sputnik::Outcome;
+
+use crate::{
+    command::{CliOutput, auth::grants::revoke::error::GrantsRevokeError},
+    options::JsonVersion,
+    plugin::error::PluginFailure,
+};
+
+/// A specialized `Error` type for Rover that wraps `anyhow`
+/// and provides some extra `Metadata` for end users depending
+/// on the specific error they encountered.
+#[derive(Debug)]
+pub struct RoverError {
+    error: anyhow::Error,
+    metadata: RoverErrorMetadata,
+}
+
+impl Serialize for RoverError {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut data = serializer.serialize_struct("error", 3)?;
+        data.serialize_field("message", &self.error.to_string())?;
+
+        // `BuildErrors` already carry their own structured detail, so surface that directly.
+        // Otherwise, surface the rest of the `anyhow` cause chain (the "Caused by:" lines shown
+        // in plain-text output) so that `--format json` consumers get the same file-level detail
+        // — e.g. which schema file could not be found during `supergraph compose`. We respect
+        // `skip_printing_cause` for parity with the `Display` impl: some errors (e.g. reqwest)
+        // already fold their cause into the top-level message.
+        if let Some(build_errors) = self
+            .error
+            .downcast_ref::<RoverClientError>()
+            .and_then(Error::source)
+            .and_then(|source| source.downcast_ref::<BuildErrors>())
+        {
+            data.serialize_field("details", build_errors)?;
+        } else if !self.metadata.skip_printing_cause {
+            let causes: Vec<String> = self
+                .error
+                .chain()
+                .skip(1)
+                .map(ToString::to_string)
+                .collect();
+            if !causes.is_empty() {
+                data.serialize_field("causes", &causes)?;
+            }
+        }
+
+        data.serialize_field("code", &self.metadata.code)?;
+
+        // FR87: a plugin failure names the plugin and what was asked of it as fields, so a
+        // script never has to parse them out of `message`.
+        if let Some(failure) = self.plugin_failure()
+            && let (Some(plugin), Some(requested)) = (failure.plugin(), failure.requested())
+        {
+            data.serialize_field("plugin", &plugin.to_string())?;
+            data.serialize_field("requested_version", &requested.to_string())?;
+        }
+        data.end()
+    }
+}
+
+/// What an HTTP error status says: a 4xx is the user's to correct, a 5xx isn't.
+fn status_outcome(status: StatusCode) -> Option<Outcome> {
+    if status.is_client_error() {
+        Some(Outcome::UserError)
+    } else if status.is_server_error() {
+        Some(Outcome::InternalError)
+    } else {
+        None
+    }
+}
+
+impl RoverError {
+    pub fn new<E>(error: E) -> Self
+    where
+        E: Into<anyhow::Error>,
+    {
+        let mut error = error.into();
+        let metadata = RoverErrorMetadata::from(error.borrow_mut());
+
+        Self { error, metadata }
+    }
+
+    pub fn set_suggestion(&mut self, suggestion: RoverErrorSuggestion) {
+        self.metadata.suggestions.push(suggestion);
+    }
+
+    pub fn with_suggestion(mut self, suggestion: RoverErrorSuggestion) -> Self {
+        self.set_suggestion(suggestion);
+        self
+    }
+
+    /// Marks this error's message as fully self-contained, so `Display`
+    /// prints just the top message (via the inner `anyhow::Error`'s own
+    /// `Display`) instead of its `Debug` representation - which, unlike
+    /// `Display`, can include a "Stack backtrace:" section whenever
+    /// backtrace capturing happens to be enabled (`RUST_BACKTRACE`/
+    /// `RUST_LIB_BACKTRACE`), independent of whether there's a real cause
+    /// chain to show. Use this for a leaf error whose message already says
+    /// everything a reader needs, the same way `RoverErrorMetadata`'s
+    /// type-downcast rules do for specific known error types.
+    pub const fn with_skip_printing_cause(mut self) -> Self {
+        self.metadata.skip_printing_cause = true;
+        self
+    }
+
+    pub fn suggestions(&self) -> &[RoverErrorSuggestion] {
+        &self.metadata.suggestions
+    }
+
+    pub fn message(&self) -> String {
+        self.error.to_string()
+    }
+
+    /// How a command that fails with this error ends. What an HTTP failure in
+    /// the error says decides first: a 4xx status is the user's to correct, a
+    /// 5xx isn't, and a failure to reach a server is a connection error.
+    /// Otherwise the error's code decides, and an error with no code is
+    /// internal.
+    pub fn outcome(&self) -> Outcome {
+        self.http_outcome().unwrap_or_else(|| {
+            self.metadata
+                .code
+                .as_ref()
+                .map_or(Outcome::InternalError, RoverErrorCode::outcome)
+        })
+    }
+
+    /// The outcome an HTTP failure in this error's chain implies, if there is
+    /// one, whichever HTTP stack produced it.
+    fn http_outcome(&self) -> Option<Outcome> {
+        if let Some(status) = self
+            .plugin_failure()
+            .and_then(PluginFailure::download_status)
+        {
+            return status_outcome(status);
+        }
+        self.error.chain().find_map(|cause| {
+            if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
+                return match error.status() {
+                    Some(status) => status_outcome(status),
+                    // Rover couldn't use the response, or couldn't build the
+                    // request at all: neither is a failure to reach the server.
+                    None if error.is_decode() || error.is_builder() || error.is_redirect() => {
+                        Some(Outcome::InternalError)
+                    }
+                    None => None,
+                };
+            }
+            match cause.downcast_ref::<HttpServiceError>()? {
+                HttpServiceError::BadStatusCode { status_code, .. } => status_outcome(*status_code),
+                HttpServiceError::TimedOut
+                | HttpServiceError::Connect(_)
+                | HttpServiceError::Closed(_)
+                | HttpServiceError::Body(_) => Some(Outcome::ConnectionError),
+                HttpServiceError::Http(_)
+                | HttpServiceError::Cancelled(_)
+                | HttpServiceError::Decode(_)
+                | HttpServiceError::Request(_)
+                | HttpServiceError::Unexpected(_)
+                | HttpServiceError::InfallibleBody(_) => Some(Outcome::InternalError),
+            }
+        })
+    }
+
+    pub fn code(&self) -> Option<RoverErrorCode> {
+        self.metadata.code.clone()
+    }
+
+    /// The plugin failure behind this error, if there is one, so that a
+    /// caller converting it into its own error type can keep it.
+    pub(crate) fn plugin_failure(&self) -> Option<&PluginFailure> {
+        crate::plugin::error::find_in_chain(&self.error)
+    }
+
+    pub fn print(&self) -> RoverResult<()> {
+        // FR62/FR63: a partial sweep still reports every client's outcome on stdout, and names
+        // the clients to retry on stderr, ahead of the error line itself.
+        if let Some(GrantsRevokeError::PartialFailure { output }) =
+            self.error.downcast_ref::<GrantsRevokeError>()
+        {
+            stdoutln!("{}", output.text())?;
+            calm_io::stderrln!("{}", output.summary())?;
+        }
+
+        match self.error.downcast_ref::<RoverClientError>() {
+            Some(RoverClientError::CheckWorkflowFailure {
+                graph_ref: _,
+                check_response,
+            }) => stdoutln!(
+                "{}",
+                crate::command::check_output::CheckWorkflowOutput(check_response).text()
+            )?,
+            Some(RoverClientError::LintFailures { lint_response }) => {
+                stdoutln!("{}", lint_response.get_ariadne()?)?
+            }
+            // FR17: `keys: None` means nothing is in scope to show best-effort - falls through
+            // to the wildcard arm below, printing no recovered data at all.
+            Some(RoverClientError::PairListFailure {
+                keys: Some(keys), ..
+            }) => stdoutln!(
+                "{}",
+                crate::command::api_key::list::output::keys_table_text(keys)
+            )?,
+            _ => (),
+        }
+
+        stderr!("{}", self)?;
+        Ok(())
+    }
+
+    pub(crate) fn get_internal_data_json(&self) -> Value {
+        // A run that failed still reports the plugin it used (FR57): the first
+        // question asked of a composition failure is which federation version
+        // rejected the schema, and `--format json` has no other field carrying
+        // it — `error` renders the plugin's identity only inside its prose.
+        //
+        // Read by downcast rather than by a field on `RoverError`, so this stays
+        // an extension point three errors already use rather than a new
+        // obligation on all 112 construction sites.
+        //
+        // Empty rather than absent when nothing resolved, because FR57's
+        // presence guarantee is what lets a consumer tell "this run used no
+        // plugin" from "this Rover predates the field" — and only a plugin-using
+        // command reaches here, so the field is never bolted onto errors from
+        // commands that have no plugins to report.
+        #[cfg(feature = "composition-js")]
+        {
+            use crate::composition::{CompositionError, supergraph::binary::BinaryError};
+
+            if let Some(error) = self.error.downcast_ref::<CompositionError>() {
+                return json!({ "plugins": error.provenance().into_iter().collect::<Vec<_>>() });
+            }
+
+            if let Some(error) = self.error.downcast_ref::<BinaryError>() {
+                return json!({ "plugins": [error.provenance()] });
+            }
+
+            // Resolution never got as far as a plugin — a missing or malformed
+            // `supergraph.yaml` is the commonest way a plugin-using command
+            // fails, and it has to report an empty array rather than no field
+            // for the guarantee above to be worth anything.
+            if self
+                .error
+                .downcast_ref::<crate::composition::pipeline::CompositionPipelineError>()
+                .is_some()
+            {
+                return json!({ "plugins": [] });
+            }
+        }
+
+        // A plugin that failed to resolve is not one a run used (FR57), so the failure
+        // reports none; its identity is in the error (FR87). The array is still there, so a
+        // consumer can tell "no plugin was used" from "this Rover predates the field".
+        if self.plugin_failure().is_some() {
+            return json!({ "plugins": [] });
+        }
+
+        // FR67: `data` carries every client on a partial failure, so a runbook can read which to
+        // retry without parsing `error.message`.
+        if let Some(GrantsRevokeError::PartialFailure { output }) =
+            self.error.downcast_ref::<GrantsRevokeError>()
+        {
+            return output
+                .json()
+                .expect("a sweep report is plain strings and booleans, so always serializes");
+        }
+
+        match self.error.downcast_ref::<RoverClientError>() {
+            Some(RoverClientError::CheckWorkflowFailure {
+                graph_ref: _,
+                check_response,
+            })
+            | Some(RoverClientError::PublishCheckFailure {
+                graph_ref: _,
+                check_response,
+            }) => check_response.get_json(),
+            Some(RoverClientError::LintFailures { lint_response }) => lint_response.get_json(),
+            Some(RoverClientError::PublishLaunchFailure {
+                graph_ref: _,
+                publish_response,
+            })
+            | Some(RoverClientError::PublishLaunchTimeout {
+                url: _,
+                publish_response,
+            }) => publish_response.clone(),
+            // FR17: `keys: None` omits `data.keys` entirely, matching FR11's own
+            // omission-vs-null rule for the success path, rather than reporting a `null` keys
+            // field that would be a new, unestablished shape.
+            Some(RoverClientError::PairListFailure { keys, .. }) => {
+                let mut data = serde_json::Map::new();
+                if let Some(keys) = keys {
+                    data.insert(
+                        "keys".to_string(),
+                        crate::command::api_key::list::output::keys_json(keys),
+                    );
+                }
+                data.insert("client_credentials".to_string(), Value::Null);
+                data.insert("client_credentials_next_after".to_string(), Value::Null);
+                Value::Object(data)
+            }
+            _ => Value::Null,
+        }
+    }
+
+    pub(crate) fn get_internal_error_json(&self) -> Value {
+        #[cfg(feature = "composition-js")]
+        {
+            use crate::composition::CompositionError;
+            match self.error.downcast_ref::<CompositionError>() {
+                Some(CompositionError::Build { source, .. }) => {
+                    json!({"details": source, "code": self.code(), "message": self.message()})
+                }
+                _ => json!(self),
+            }
+        }
+        #[cfg(not(feature = "composition-js"))]
+        json!(self)
+    }
+
+    pub(crate) fn get_json_version(&self) -> JsonVersion {
+        match &self.error.downcast_ref::<RoverClientError>() {
+            Some(RoverClientError::CheckWorkflowFailure {
+                graph_ref: _,
+                check_response: _,
+            })
+            | Some(RoverClientError::PublishCheckFailure {
+                graph_ref: _,
+                check_response: _,
+            }) => JsonVersion::Three,
+            _ => self.metadata.json_version.clone(),
+        }
+    }
+}
+
+impl Display for RoverError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let error_descriptor_message = if let Some(code) = &self.metadata.code {
+            format!("error[{code}]:")
+        } else {
+            "error:".to_string()
+        };
+        let error_descriptor = Style::ErrorPrefix.paint(error_descriptor_message);
+
+        if self.metadata.skip_printing_cause {
+            writeln!(formatter, "{} {}", error_descriptor, self.error)?;
+        } else {
+            writeln!(formatter, "{} {:?}", error_descriptor, self.error)?;
+        }
+
+        for suggestion in &self.metadata.suggestions {
+            writeln!(formatter, "        {suggestion}")?;
+        }
+        Ok(())
+    }
+}
+
+impl<E: Into<anyhow::Error>> From<E> for RoverError {
+    fn from(error: E) -> Self {
+        Self::new(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use anyhow::anyhow;
+    use bytes::Bytes;
+    use http::StatusCode;
+    use http_body_util::Full;
+    use httpmock::MockServer;
+    use rover_client::{EndpointKind, RoverClientError};
+    use rover_graphql::GraphQLServiceError;
+    use rover_http::HttpServiceError;
+    use serde_json::json;
+    use speculoos::prelude::*;
+    use sputnik::Outcome;
+
+    use super::RoverError;
+    use crate::{
+        RoverErrorCode,
+        plugin::{
+            error::PluginFailure,
+            version::{PluginName, VersionRequest},
+        },
+    };
+
+    /// A failure from a Studio GraphQL operation, which goes through `rover-http`'s
+    /// Tower stack and so carries no `reqwest::Error` and no error code.
+    fn tower_error(error: HttpServiceError) -> RoverError {
+        RoverError::new(RoverClientError::Service {
+            source: Box::new(GraphQLServiceError::<()>::UpstreamService(Box::new(error))),
+            endpoint_kind: EndpointKind::ApolloStudio,
+        })
+    }
+
+    fn bad_status(status: StatusCode) -> HttpServiceError {
+        HttpServiceError::BadStatusCode {
+            status_code: status,
+            response: http::Response::new(Full::new(Bytes::new())),
+        }
+    }
+
+    fn io(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(std::io::Error::other(message.to_string()))
+    }
+
+    #[rstest::rstest]
+    #[case::bad_request(bad_status(StatusCode::BAD_REQUEST), Outcome::UserError)]
+    #[case::not_found(bad_status(StatusCode::NOT_FOUND), Outcome::UserError)]
+    #[case::server_error(bad_status(StatusCode::INTERNAL_SERVER_ERROR), Outcome::InternalError)]
+    #[case::unavailable(bad_status(StatusCode::SERVICE_UNAVAILABLE), Outcome::InternalError)]
+    #[case::timed_out(HttpServiceError::TimedOut, Outcome::ConnectionError)]
+    #[case::connect(HttpServiceError::Connect(io("refused")), Outcome::ConnectionError)]
+    #[case::closed(HttpServiceError::Closed(io("closed")), Outcome::ConnectionError)]
+    #[case::body(HttpServiceError::Body(io("reset")), Outcome::ConnectionError)]
+    #[case::decode(HttpServiceError::Decode(io("garbled")), Outcome::InternalError)]
+    #[case::unexpected(HttpServiceError::Unexpected(io("odd")), Outcome::InternalError)]
+    fn a_failure_through_the_tower_stack_is_decided_by_what_it_says(
+        #[case] error: HttpServiceError,
+        #[case] expected: Outcome,
+    ) {
+        assert_that!(tower_error(error).outcome()).is_equal_to(expected);
+    }
+
+    #[rstest::rstest]
+    #[case::refused_by_the_registry(Some(StatusCode::NOT_FOUND), Outcome::UserError)]
+    #[case::registry_failing(Some(StatusCode::BAD_GATEWAY), Outcome::InternalError)]
+    #[case::dropped_or_timed_out(None, Outcome::ConnectionError)]
+    fn a_plugin_download_failure_is_decided_by_its_status_when_it_has_one(
+        #[case] status: Option<StatusCode>,
+        #[case] expected: Outcome,
+    ) {
+        let error = RoverError::new(PluginFailure::Download {
+            plugin: PluginName::Router,
+            requested: VersionRequest::Major(2),
+            version: semver::Version::new(2, 1, 0),
+            status,
+            source: std::sync::Arc::from(io("transfer failed")),
+        });
+        assert_that!(error.code()).is_equal_to(Some(RoverErrorCode::E049));
+        assert_that!(error.outcome()).is_equal_to(expected);
+    }
+
+    #[tokio::test]
+    async fn a_response_that_cannot_be_decoded_is_an_internal_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.any_request();
+            then.status(200).body("not json");
+        });
+        let source = reqwest::get(server.base_url())
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_err();
+        let error = RoverError::new(RoverClientError::SendRequest {
+            source,
+            endpoint_kind: EndpointKind::ApolloStudio,
+        });
+        // E004 is the code for a request that couldn't be executed, which is
+        // a connection error; but the server did answer.
+        assert_that!(error.code()).is_equal_to(Some(RoverErrorCode::E004));
+        assert_that!(error.outcome()).is_equal_to(Outcome::InternalError);
+    }
+
+    async fn send_request_error(
+        url: &str,
+        timeout: Duration,
+        error_for_status: bool,
+    ) -> RoverError {
+        let response = reqwest::Client::new()
+            .get(url)
+            .timeout(timeout)
+            .send()
+            .await;
+        let source = if error_for_status {
+            response.and_then(|r| r.error_for_status()).unwrap_err()
+        } else {
+            response.unwrap_err()
+        };
+        RoverError::new(RoverClientError::SendRequest {
+            source,
+            endpoint_kind: EndpointKind::Customer,
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::not_found(404, Outcome::UserError)]
+    #[case::unauthorized(401, Outcome::UserError)]
+    #[case::server_error(500, Outcome::InternalError)]
+    #[case::unavailable(503, Outcome::InternalError)]
+    #[tokio::test]
+    async fn an_http_error_response_is_decided_by_its_status(
+        #[case] status: u16,
+        #[case] expected: Outcome,
+    ) {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.any_request();
+            then.status(status);
+        });
+        let error = send_request_error(&server.base_url(), Duration::from_secs(5), true).await;
+        assert_that!(error.outcome()).is_equal_to(expected);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_a_connection_error() {
+        // A port that was just free, so nothing is listening on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let error = send_request_error(
+            &format!("http://127.0.0.1:{port}"),
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
+        assert_that!(error.outcome()).is_equal_to(Outcome::ConnectionError);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_request_is_a_connection_error() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.any_request();
+            then.status(200).delay(Duration::from_secs(5));
+        });
+        let error = send_request_error(&server.base_url(), Duration::from_millis(50), false).await;
+        assert_that!(error.outcome()).is_equal_to(Outcome::ConnectionError);
+    }
+
+    #[test]
+    fn a_user_correctable_error_is_a_user_error() {
+        let error = RoverError::new(RoverClientError::InvalidKey);
+        assert_that!(error.outcome()).is_equal_to(Outcome::UserError);
+    }
+
+    #[test]
+    fn an_error_with_no_code_is_an_internal_error() {
+        let error = RoverError::new(anyhow!("something unexpected"));
+        assert_that!(error.code()).is_none();
+        assert_that!(error.outcome()).is_equal_to(Outcome::InternalError);
+    }
+
+    #[test]
+    fn json_output_surfaces_the_anyhow_cause_chain() {
+        // Mirrors the `supergraph compose` file-not-found case: the io error is the outermost
+        // message and "could not find '<path>'" is the cause (see rover_std::Fs::read_file).
+        let error = anyhow!("could not find '/path/to/schema.graphql'")
+            .context("No such file or directory (os error 2)");
+        let value = serde_json::to_value(RoverError::new(error)).unwrap();
+
+        assert_eq!(
+            value["message"],
+            json!("No such file or directory (os error 2)")
+        );
+        assert_eq!(
+            value["causes"],
+            json!(["could not find '/path/to/schema.graphql'"])
+        );
+    }
+
+    #[test]
+    fn json_output_omits_causes_for_a_single_error() {
+        let value = serde_json::to_value(RoverError::new(anyhow!("a flat error"))).unwrap();
+
+        assert_eq!(value["message"], json!("a flat error"));
+        assert!(value.get("causes").is_none());
+    }
+
+    #[cfg(feature = "composition-js")]
+    mod plugins_on_the_failure_path {
+        use apollo_federation_types::{
+            config::FederationVersion,
+            rover::{BuildError, BuildErrors},
+        };
+        use camino::Utf8PathBuf;
+        use rstest::rstest;
+        use semver::Version;
+        use serde_json::json;
+        use speculoos::prelude::*;
+
+        use super::RoverError;
+        use crate::{
+            command::install::{PluginLevel, PluginProvenance, PluginSource},
+            composition::{
+                CompositionError, pipeline::CompositionPipelineError,
+                supergraph::binary::BinaryError,
+            },
+            options::JsonOutput,
+        };
+
+        /// `BuildErrors` renders its own length, so it has to be non-empty.
+        fn build_errors() -> BuildErrors {
+            BuildErrors::from(vec![BuildError::composition_error(
+                Some("E029".to_string()),
+                Some("a field is not resolvable".to_string()),
+                None,
+                None,
+            )])
+        }
+
+        fn provenance() -> PluginProvenance {
+            PluginProvenance::new(
+                "supergraph",
+                Version::new(2, 9, 3),
+                PluginSource::Downloaded,
+                PluginLevel::Global,
+                Utf8PathBuf::from("/plugins/supergraph-v2.9.3"),
+            )
+        }
+
+        /// The entry a successful run reports under `data.plugins`. A failure
+        /// has to report the same shape or a consumer needs two readers.
+        fn expected_entry() -> serde_json::Value {
+            json!({
+                "name": "supergraph",
+                "version": "2.9.3",
+                "source": "downloaded",
+                "level": "global",
+                "path": "/plugins/supergraph-v2.9.3",
+            })
+        }
+
+        /// Walks the real path — through `RoverError` and the JSON envelope —
+        /// rather than calling the accessor, since the envelope is the contract.
+        fn data_of(error: impl Into<anyhow::Error>) -> serde_json::Value {
+            let rover_error = RoverError::new(error.into());
+            let envelope = serde_json::to_value(JsonOutput::from(&rover_error)).unwrap();
+            envelope["data"].clone()
+        }
+
+        #[test]
+        fn a_failed_composition_reports_the_binary_that_produced_the_errors() {
+            let data = data_of(CompositionError::Build {
+                source: build_errors(),
+                federation_version: FederationVersion::ExactFedTwo(Version::new(2, 9, 3)),
+                provenance: Box::new(provenance()),
+            });
+
+            assert_that!(data).is_equal_to(json!({
+                "plugins": [expected_entry()],
+                "success": false,
+            }));
+        }
+
+        #[test]
+        fn a_failed_connector_run_reports_the_binary_it_ran() {
+            let data = data_of(BinaryError::Exit {
+                provenance: Box::new(provenance()),
+                exit_code: Some(2),
+                stdout: String::new(),
+                stderr: "boom".to_string(),
+            });
+
+            assert_that!(data).is_equal_to(json!({
+                "plugins": [expected_entry()],
+                "success": false,
+            }));
+        }
+
+        /// Empty, not absent. A plugin that never resolved has no source, level
+        /// or path to report (FR57's one exclusion; FR87 carries its identity
+        /// instead) — but the field still has to be there, or a consumer cannot
+        /// tell "used no plugin" from "this Rover predates the field".
+        #[rstest]
+        #[case::resolution_never_reached_a_binary(CompositionError::InvalidSupergraphConfig(
+            "bad config".to_string(),
+        ))]
+        #[case::nothing_resolved_before_the_write_failed(CompositionError::WriteFile {
+            path: Utf8PathBuf::from("/tmp/supergraph.yaml"),
+            error: Box::new(std::io::Error::other("disk full")),
+            provenance: None,
+        })]
+        fn an_error_with_no_plugin_behind_it_reports_an_empty_array(
+            #[case] error: CompositionError,
+        ) {
+            assert_that!(data_of(error)).is_equal_to(json!({ "plugins": [], "success": false }));
+        }
+
+        /// The commonest way a plugin-using command fails is never reaching a
+        /// plugin at all — a missing or malformed `supergraph.yaml`. That is a
+        /// different error type entirely, and the presence guarantee has to
+        /// cover it or it doesn't cover the case anyone will actually hit.
+        #[test]
+        fn failing_before_resolution_still_reports_an_empty_array() {
+            let error = CompositionPipelineError::Io(std::io::Error::other(
+                "could not read supergraph.yaml",
+            ));
+
+            assert_that!(data_of(error)).is_equal_to(json!({ "plugins": [], "success": false }));
+        }
+
+        /// The run resolved a plugin, printed its FR54 line to stderr, and then
+        /// failed for a reason that is not the plugin's fault. Reporting nothing
+        /// here would have one run answering "which plugin?" two different ways
+        /// on two channels.
+        #[rstest]
+        #[case::the_temporary_directory(CompositionError::TempDir {
+            source: std::io::Error::other("no space left on device"),
+            provenance: Some(Box::new(provenance())),
+        })]
+        #[case::the_config_write(CompositionError::WriteFile {
+            path: Utf8PathBuf::from("/tmp/supergraph.yaml"),
+            error: Box::new(std::io::Error::other("disk full")),
+            provenance: Some(Box::new(provenance())),
+        })]
+        #[case::the_config_serialisation(CompositionError::SerdeYaml {
+            source: serde_yaml::from_str::<serde_yaml::Value>("[1, 2").unwrap_err(),
+            provenance: Some(Box::new(provenance())),
+        })]
+        fn a_failure_beside_the_plugin_still_names_it(#[case] error: CompositionError) {
+            assert_that!(data_of(error)).is_equal_to(json!({
+                "plugins": [expected_entry()],
+                "success": false,
+            }));
+        }
+
+        /// The Fixes entry this variant carries promises the cause is shown.
+        /// It only is because `#[source]` puts it on the chain — the message
+        /// itself deliberately does not interpolate it.
+        #[test]
+        fn the_temp_directory_failure_names_the_step_and_keeps_its_cause() {
+            let error = RoverError::new(CompositionError::TempDir {
+                source: std::io::Error::other("no space left on device"),
+                provenance: None,
+            });
+            let value = serde_json::to_value(&error).unwrap();
+
+            assert_that!(value["message"].as_str().unwrap())
+                .is_equal_to("Failed to create a temporary directory for the composition input.");
+            assert_that!(value["causes"]).is_equal_to(json!(["no space left on device"]));
+        }
+
+        #[test]
+        fn every_error_the_binary_raises_carries_its_provenance() {
+            let errors = [
+                CompositionError::Binary {
+                    error: "spawn failed".to_string(),
+                    provenance: Box::new(provenance()),
+                },
+                CompositionError::BinaryExit {
+                    exit_code: Some(2),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    provenance: Box::new(provenance()),
+                },
+                CompositionError::InvalidOutput {
+                    provenance: Box::new(provenance()),
+                    error: "not json".to_string(),
+                },
+                CompositionError::EmptyOutput {
+                    provenance: Box::new(provenance()),
+                },
+                CompositionError::InvalidInput {
+                    provenance: Box::new(provenance()),
+                    error: "bad version".to_string(),
+                },
+                CompositionError::Build {
+                    source: build_errors(),
+                    federation_version: FederationVersion::ExactFedTwo(Version::new(2, 9, 3)),
+                    provenance: Box::new(provenance()),
+                },
+            ];
+
+            let reported: Vec<Option<PluginProvenance>> = errors
+                .iter()
+                .map(|error| error.provenance().cloned())
+                .collect();
+
+            assert_that!(reported).is_equal_to(vec![Some(provenance()); 6]);
+        }
+    }
+
+    mod pair_list_failure {
+        use chrono::DateTime;
+        use rover_client::{
+            RoverClientError,
+            operations::api_key::list::{ApiKey, ApiKeyBackendType},
+        };
+        use serde_json::json;
+        use speculoos::prelude::*;
+
+        use super::RoverError;
+        use crate::options::JsonOutput;
+
+        fn keys() -> Vec<ApiKey> {
+            vec![ApiKey {
+                created_at: DateTime::parse_from_rfc3339("2026-01-04T12:00:00Z").unwrap(),
+                expires_at: None,
+                id: "key-123".to_string(),
+                name: Some("router-prod".to_string()),
+                key_type: Some(ApiKeyBackendType::Operator),
+            }]
+        }
+
+        /// Walks the real path - through `RoverError` and the JSON envelope - rather than
+        /// calling the accessor, since the envelope is the contract.
+        fn data_of(error: RoverClientError) -> serde_json::Value {
+            let rover_error = RoverError::new(error);
+            let envelope = serde_json::to_value(JsonOutput::from(&rover_error)).unwrap();
+            envelope["data"].clone()
+        }
+
+        #[test]
+        fn a_genuine_pairs_failure_still_reports_the_keys_already_fetched() {
+            let data = data_of(RoverClientError::PairListFailure {
+                organization_id: "acme".to_string(),
+                keys: Some(keys()),
+                source: Box::new(RoverClientError::ClientError {
+                    msg: "timed out".to_string(),
+                }),
+            });
+
+            assert_that!(data).is_equal_to(json!({
+                "keys": [
+                    {
+                        "created_at": "2026-01-04T12:00:00Z",
+                        "expires_at": null,
+                        "id": "key-123",
+                        "name": "router-prod",
+                        "key_type": "Operator",
+                    }
+                ],
+                "client_credentials": null,
+                "client_credentials_next_after": null,
+                "success": false,
+            }));
+        }
+
+        #[test]
+        fn a_genuine_pairs_failure_gets_its_own_stable_error_code() {
+            let error = RoverError::new(RoverClientError::PairListFailure {
+                organization_id: "acme".to_string(),
+                keys: Some(keys()),
+                source: Box::new(RoverClientError::ClientError {
+                    msg: "timed out".to_string(),
+                }),
+            });
+
+            assert_that!(error.code().map(|code| code.to_string()))
+                .is_some()
+                .is_equal_to("E056".to_string());
+        }
+
+        // FR17: a pairs-only failure (keys never in scope) reports no keys field at all -
+        // `null` would falsely suggest keys were fetched and simply came back empty.
+        #[test]
+        fn a_pairs_only_failure_reports_no_keys_field() {
+            let data = data_of(RoverClientError::PairListFailure {
+                organization_id: "acme".to_string(),
+                keys: None,
+                source: Box::new(RoverClientError::ClientError {
+                    msg: "timed out".to_string(),
+                }),
+            });
+
+            assert_that!(data).is_equal_to(json!({
+                "client_credentials": null,
+                "client_credentials_next_after": null,
+                "success": false,
+            }));
+        }
+
+        // FR17: still gets the same stable code as FR16 - a pairs-only failure is not a
+        // different, uncoded kind of error.
+        #[test]
+        fn a_pairs_only_failure_gets_the_same_stable_error_code() {
+            let error = RoverError::new(RoverClientError::PairListFailure {
+                organization_id: "acme".to_string(),
+                keys: None,
+                source: Box::new(RoverClientError::ClientError {
+                    msg: "timed out".to_string(),
+                }),
+            });
+
+            assert_that!(error.code().map(|code| code.to_string()))
+                .is_some()
+                .is_equal_to("E056".to_string());
+        }
+    }
+}

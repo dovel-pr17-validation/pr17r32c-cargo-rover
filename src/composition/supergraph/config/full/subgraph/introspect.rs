@@ -1,0 +1,167 @@
+//! Utilities that help resolve a subgraph via introspection
+use std::{collections::HashMap, pin::Pin, sync::Arc};
+
+use apollo_federation_types::config::SchemaSource;
+use buildstructor::Builder;
+use futures::Future;
+use http::{HeaderMap, HeaderName, HeaderValue};
+use rover_client::operations::subgraph::introspect::{
+    SubgraphIntrospect, SubgraphIntrospectError, SubgraphIntrospectResponse,
+};
+use rover_graphql::GraphQLLayer;
+use rover_http::{HttpService, extend_headers::ExtendHeadersLayer};
+use tower::{Service, ServiceBuilder, ServiceExt, util::BoxCloneService};
+use url::Url;
+
+use super::FullyResolvedSubgraph;
+use crate::composition::supergraph::config::error::ResolveSubgraphError;
+
+/// Alias for a service that fully resolves a subgraph via introspection
+pub type ResolveIntrospectSubgraphService =
+    BoxCloneService<(), FullyResolvedSubgraph, ResolveSubgraphError>;
+
+/// Alias for a service that produces a [`ResolveIntrospectSubgraphService`]
+/// This is necessary, as different services may have different headers and endpoints
+/// that need to be built on-demand
+pub type ResolveIntrospectSubgraphFactory = BoxCloneService<
+    MakeResolveIntrospectSubgraphRequest,
+    ResolveIntrospectSubgraphService,
+    ResolveSubgraphError,
+>;
+
+/// [`tower::Service`] that accepts an [`HttpService`] for variable retry and timeout conditions
+#[derive(Clone, Debug)]
+pub struct MakeResolveIntrospectSubgraph {
+    http_service: HttpService,
+}
+
+impl MakeResolveIntrospectSubgraph {
+    /// Constructs a new [`MakeResolveIntrospectSubgraph`]
+    pub const fn new(http_service: HttpService) -> MakeResolveIntrospectSubgraph {
+        MakeResolveIntrospectSubgraph { http_service }
+    }
+}
+
+/// Request object that specifies the necessary details to introspect a subgraph
+#[derive(Clone, Debug, Builder, PartialEq, Eq)]
+pub struct MakeResolveIntrospectSubgraphRequest {
+    endpoint: Url,
+    routing_url: Option<String>,
+    headers: HashMap<String, String>,
+    subgraph_name: String,
+}
+
+impl Service<MakeResolveIntrospectSubgraphRequest> for MakeResolveIntrospectSubgraph {
+    type Response = BoxCloneService<(), FullyResolvedSubgraph, ResolveSubgraphError>;
+    type Error = ResolveSubgraphError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: MakeResolveIntrospectSubgraphRequest) -> Self::Future {
+        let http_service = self.http_service.clone();
+        let fut = async move {
+            let endpoint = req.endpoint;
+            let headers = req.headers;
+            let subgraph_name = req.subgraph_name;
+            let routing_url = req.routing_url.clone();
+            let header_map = headers
+                .iter()
+                .map(|(key, value)| {
+                    HeaderName::from_bytes(key.as_bytes())
+                        .map_err(|err| ResolveSubgraphError::HeaderName {
+                            source: Arc::new(err),
+                        })
+                        .and_then(|key| {
+                            HeaderValue::from_str(value)
+                                .map_err(|err| ResolveSubgraphError::HeaderValue {
+                                    source: Arc::new(err),
+                                })
+                                .map(|value| (key, value))
+                        })
+                })
+                .collect::<Result<HeaderMap, _>>()?;
+            let introspect_service = ServiceBuilder::new()
+                .boxed_clone()
+                .layer_fn(SubgraphIntrospect::new)
+                .layer(GraphQLLayer::new(endpoint.clone()))
+                .layer(ExtendHeadersLayer::new(header_map))
+                .service(http_service);
+            Ok(ResolveIntrospectSubgraph::builder()
+                .inner(introspect_service)
+                .subgraph_name(subgraph_name)
+                .routing_url(routing_url.unwrap_or_else(|| endpoint.to_string()))
+                .introspection_headers(headers)
+                .build()
+                .boxed_clone())
+        };
+        Box::pin(fut)
+    }
+}
+
+/// [`tower::Service`] that fully resolves a subgraph via introspection
+#[derive(Builder, Clone)]
+pub struct ResolveIntrospectSubgraph<S>
+where
+    S: Clone,
+{
+    inner: S,
+    subgraph_name: String,
+    routing_url: String,
+    introspection_headers: Option<HashMap<String, String>>,
+}
+
+impl<S> Service<()> for ResolveIntrospectSubgraph<S>
+where
+    S: Service<(), Response = SubgraphIntrospectResponse, Error = SubgraphIntrospectError>
+        + Clone
+        + Send
+        + 'static,
+    S::Future: Send,
+{
+    type Response = FullyResolvedSubgraph;
+    type Error = ResolveSubgraphError;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner
+            .poll_ready(cx)
+            .map_err(|err| ResolveSubgraphError::ServiceReady(Arc::new(Box::new(err))))
+    }
+
+    fn call(&mut self, _req: ()) -> Self::Future {
+        let cloned = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, cloned);
+        let subgraph_name = self.subgraph_name.to_string();
+        let routing_url = self.routing_url.to_string();
+        let introspection_headers = self.introspection_headers.clone();
+        let fut =
+            async move {
+                let subgraph_url = Url::parse(&routing_url)?;
+                let schema = inner.call(()).await.map_err(|err| {
+                    ResolveSubgraphError::IntrospectionError {
+                        subgraph_name: subgraph_name.to_string(),
+                        source: Arc::new(Box::new(err)),
+                    }
+                })?;
+                Ok(FullyResolvedSubgraph::builder()
+                    .name(subgraph_name)
+                    .routing_url(routing_url)
+                    .schema(schema.result)
+                    .schema_source(SchemaSource::SubgraphIntrospection {
+                        subgraph_url,
+                        introspection_headers,
+                    })
+                    .build())
+            };
+        Box::pin(fut)
+    }
+}

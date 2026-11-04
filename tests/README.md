@@ -1,0 +1,83 @@
+# Tests
+
+This README is a work in progress. If anything is confusing or unclear, please open an issue or pull request!
+
+## End-to-end tests
+
+Our end-to-end tests can be run either locally or in GitHub. We use an example supergraph from Apollo Solutions called [retail supergraph](https://github.com/apollosolutions/retail-supergraph) as a basis for many of the tests.
+
+### Developing new end-to-end tests
+
+#### Windows and Unix
+
+We're developing for _both_ unix-based systems (Linux, MacOS) and Windows. This leads to some surprising things (like how environment variables are handled; you can't just prepend `SOME_VAR=` in powershell), which can be checked for by running the smoke tests (detailed below). 
+
+#### `RetailSupergraph`
+
+A struct with methods for interacting with the retail supergraph (e.g., getting subgraph names or URLs) and related metadata (e.g., the working directory where the retail supergraph was git cloned).  
+
+#### Fixtures
+
+Fixtures allow us to reuse either data or functionality across tests. We use [rstest](https://docs.rs/rstest/latest/rstest)'s [fixtures](https://docs.rs/rstest/latest/rstest/attr.fixture.html) and being familiar with that crate will be useful when developing tests for Rover.
+
+Some tests need subgraphs to be running (e.g., `rover dev`), but others don't. To use running subgraphs, use the `run_subgraphs_retail_supergraph` fixture. This fixture returns `RetailSupergraph` and the methods from that struct can be used in tests. See the `e2e/dev.rs` for an example.
+
+For those that only need certain data about the supergraph config, you can use the fixture `retail_supergraph`. See `e2e/supergraph/compose.rs` for an example.
+
+
+#### Fixtureless tests
+
+Some tests (like testing subcommand or option failures) don't need to use any fixture at all. That's okay! Don't feel like you need to add fixtures when they're irrelevant to your test. And, if a fixture's use doesn't make sense, raise a ticket so that we can either make it clearer in code or the documentation.
+
+
+### Locally
+
+#### Gotchas
+
+Some tests require Apollo-only access. These generally access resources that are gated behind having the right level of privilege (e.g., supergraphs, graphOS organizations, and so on). If you attempt to run all the tests at once and see failures, this might be why. 
+
+For Apollo folks wanting to develop tests locally, ask someone from the Rover team or browse the internal Rover docs for information on how to run Rover with the right level of privileges.
+
+
+#### Pre-requisites
+
+You'll need to be able to use `cargo` and have some familiarity with `cargo test`, but you'll also need to install NodeJS and Git because these are used to clone and then build and run a set of subgraphs that rover commands are issued against.
+
+#### Running the tests
+
+The following command runs our end-to-end tests, which are `ignored` intentionally because we don't want to run them along with all of our tests because that would slow down our local feedback loop tremendously:
+
+`cargo test e2e -- --ignored`
+
+Note: use `--nocapture` to get print statements:
+
+`cargo test e2e -- --ignored --nocapture`
+
+Particular tests can be targeted for a faster feedback loop:
+
+`cargo test e2e::supergraph::compose::it_fails_without_a_config -- --ignored --nocapture`
+
+### GitHub
+
+#### Smoke tests
+
+Smoke tests run against our supported architectures and operating systems automatically, on every pull request, in the merge queue, and on pushes to `main`. The [`run-smokes-on-pr.yml`](../.github/workflows/run-smokes-on-pr.yml) workflow calculates the federation and router versions to test, so there is nothing to trigger by hand.
+
+## Integration tests
+
+Integration tests live in `tests/integration/` and run against the compiled `rover` binary via `assert_cmd`. They are not `#[ignore]`d, so they run as part of `cargo test` and `mise run test`.
+
+### Project files above a test's working directory
+
+The binary these tests (and the end-to-end tests) run isn't built with `cfg(test)`, so it looks for a project's `rover.yaml` (in a `.rover/` directory) from its real working directory, walking up until it reaches your home directory. A project `rover.yaml` above a test's working directory therefore applies its `settings:` to that test. A credential in it fails every command the test runs. A test that depends on project-file behavior should create its own project in a temporary directory and set `current_dir` to it.
+
+### Snapshot tests
+
+Some integration tests (e.g. `tests/integration/client/extract.rs`) use [`insta`](https://insta.rs) to assert against the full JSON output of a command. The expected output for each test is checked in under `tests/integration/<area>/snapshots/`.
+
+When a test fails because the producer's output changed, regenerate the snapshots in one of two ways:
+
+- **Interactive review** — `cargo insta review` walks each pending diff and lets you accept or reject per snapshot. One-time setup: `cargo install cargo-insta`.
+- **Bulk overwrite** — `INSTA_UPDATE=always cargo test --test main <filter>` re-runs the matching tests and writes the new output over the existing `.snap` files.
+
+Either way, commit the updated `.snap` files alongside the code change that motivated them.

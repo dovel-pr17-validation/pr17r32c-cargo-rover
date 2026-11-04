@@ -1,0 +1,186 @@
+---
+title: The Rover persisted-queries Command
+subtitle: Generate and publish persisted query manifests
+minVersion: Rover v0.17.2
+description: Generate and publish persisted query manifests for safelisting and performance optimization by using the Rover CLI persisted-queries command.
+---
+
+import AuthNotice from '../../shared/auth-notice.mdx';
+
+With [GraphOS Enterprise](https://www.apollographql.com/pricing), you can enhance a graph's security by maintaining a **persisted query list** (**PQL**) for your graph's self-hosted router. The [GraphOS Router](/router/) checks incoming requests against the PQL, and can be configured to reject operations that aren't registered in the list.
+
+Registering operations to a PQL has two steps:
+
+1. Generate persisted query manifests (PQMs) from client operations
+2. Publish PQMs to the PQL using Rover
+
+For more information on persisted query implementation steps, see the [GraphOS persisted queries documentation](/graphos/operations/persisted-queries).
+
+## Generate a PQM
+
+### `persisted-queries generate`
+
+<MinVersionBadge version="Rover v0.41.0" />
+
+Use `rover persisted-queries generate` to generate Apollo PQM from `.graphql` operation files. This command runs locally and doesn't require an API key.
+
+```bash
+rover persisted-queries generate
+```
+
+By default, Rover scans the current directory for all `.graphql` files and prints the generated manifest to `stdout`. Pass `--manifest-path` (`-m`) to write it to a file instead. This pairs with `rover client extract`, which extracts operations from client source code into a `graphql` directory:
+
+```bash
+rover client extract --out-dir graphql --overwrite
+rover persisted-queries generate --manifest-path persisted-query-manifest.json
+rover persisted-queries publish my-graph@my-variant \
+  --manifest ./persisted-query-manifest.json
+```
+
+The generated manifest uses the Apollo persisted query manifest format. Each entry has the operation's `id` (the SHA-256 hash of its `body`), its `name`, its `type` (`query`, `mutation`, or `subscription`), and its `body`:
+
+```json
+{
+  "format": "apollo-persisted-query-manifest",
+  "version": 1,
+  "operations": [
+    {
+      "id": "3a48466dcc1d7e1cc4f819f46b633a4675acb088e0a65f8113f5fba2cdf259fe",
+      "name": "GetProduct",
+      "type": "query",
+      "body": "query GetProduct($id: ID!) {\n  product(id: $id) {\n    id\n    name\n  }\n}"
+    }
+  ]
+}
+```
+
+`persisted-queries generate` supports multiple operations in a single `.graphql` file, emitting one manifest entry per operation. For each operation it removes `@client` fields and directives (pruning any variables they leave unused), includes the operation's transitively referenced fragment definitions, and generates the operation ID as the SHA-256 hash of the final operation body.
+
+To change the files Rover scans, use `--include`, `--exclude`, and `--root-dir`:
+
+```bash
+rover persisted-queries generate \
+  --root-dir ./client \
+  --include "operations/**/*.graphql" \
+  --exclude "operations/**/*.test.graphql"
+```
+
+To change the manifest output path, use `--manifest-path` (`-m`):
+
+```bash
+rover persisted-queries generate \
+  --manifest-path ./dist/persisted-query-manifest.json
+```
+
+When you write the manifest to a file, add Rover's global `--format json` flag to report the output path and operation count in Rover's standard JSON envelope:
+
+```bash
+rover persisted-queries generate \
+  --manifest-path persisted-query-manifest.json --format json
+```
+
+```json
+{
+  "json_version": "1",
+  "data": {
+    "path": "persisted-query-manifest.json",
+    "operation_count": 1,
+    "success": true
+  },
+  "error": null
+}
+```
+
+Without `--manifest-path`, the `data` field contains the full manifest instead of the path and count.
+
+The generate command doesn't write `clientName` values into the manifest. To associate every generated operation with a client name, use `persisted-queries publish --for-client-name`.
+
+#### Preserving operation comments
+
+<MinVersionBadge version="Rover v1.0.0" />
+
+By default, Rover drops comments when it normalizes an operation's body. Pass `--preserve-comments` to keep the contiguous comment block directly above each operation in that operation's `body`. Comments elsewhere in a document, such as inside the operation or separated from it by a blank line, are still dropped.
+
+Given this operation file:
+
+```graphql
+# Fetches the current user
+# for the profile page
+query Me {
+  # inner comment
+  me { id name }
+}
+```
+
+`rover persisted-queries generate --preserve-comments` generates this entry:
+
+```json
+{
+  "id": "7595ac314829543bbdbfdbf760e1470e3cb1522471ce86d7034c393ac43e5a18",
+  "name": "Me",
+  "type": "query",
+  "body": "# Fetches the current user\n# for the profile page\nquery Me {\n  me {\n    id\n    name\n  }\n}"
+}
+```
+
+<Caution>
+
+Because an operation's `id` is the hash of its `body`, `--preserve-comments` changes the ID of every operation that has a comment above it. Every client that generates a manifest for the same graph must use the same setting. Manifests generated without the flag are unchanged.
+
+</Caution>
+
+## Publish a PQM
+
+### `persisted-queries publish`
+
+<AuthNotice />
+
+You can use Rover to publish a PQM for any client to any [existing PQL](/graphos/operations/persisted-queries#1-pql-creation-and-linking). 
+
+Run the `persisted-queries publish` command, like so:
+
+```bash
+rover persisted-queries publish my-graph@my-variant \
+  --manifest ./persisted-query-manifest.json
+```
+
+- The `my-graph@my-variant` argument is the [`graph ref`](../conventions#graph-refs) of any variant the PQL is [linked to](/graphos/operations/persisted-queries#12-link-the-pql-to-variants).
+    - Graph refs have the format `graph-id@variant-name`.
+- Use the `--manifest` option to provide the path to the manifest you want to publish.
+
+Instead of `my-graph@my-variant`, you can combine the `--graph-id` and `--list-id` options to specify the PQL you want to publish to:
+
+```bash
+rover persisted-queries publish \
+  --graph-id my_graph --list-id dc4b4040-30fc-4bd1-94a3-5fc1c722acc9 \
+  --manifest ./persisted-query-manifest.json
+```
+
+- Use `--graph-id` to provide the graph's ID
+- Use `--list-id` to provide the PQL's UUID
+
+**The `persisted-queries publish` command does the following:**
+
+1. Publishes all operations in the provided manifest file to the PQL linked to the specified variant, or to the specified PQL.
+    - Publishing a manifest to a PQL is additive. Any existing entries in the PQL remain.
+    - You can use the `--for-client-name CLIENT-NAME` option to [associate all operations in the manifest with a given client name](/graphos/platform/security/persisted-queries#associating-operations-with-clients), or you can specify `clientName` on each operation in the JSON file.
+    - If you publish an operation with the same `id` and `clientName` but different details from an existing entry in the PQL, the entire publish command fails with an error.
+
+2. Updates any other variants that the PQL is applied to so that routers associated with those variants can fetch their updated PQL.
+
+As with [generating manifests](/graphos/operations/persisted-queries#31-generate-persisted-query-manifests), it's best to execute this command in your CI/CD pipeline to publish new operations as part of your app release process. This command requires your API key to have the [**Graph Admin** or **Persisted Query Publisher** role](/graphos/platform/access-management/member-roles#graph-api-key-roles); the latter is a role specifically designed to work with this command without exposing unnecessary information about your graph to users of the API key.
+
+#### Relay support
+
+<MinVersionBadge version="Rover v0.19.0" />
+
+The `rover persisted-queries` command supports publishing [persisted queries generated by the Relay compiler](https://relay.dev/docs/guides/persisted-queries/#local-persisted-queries).
+
+1. Configure the Relay compiler to output a JSON operation manifest to a specified location according to [their documentation](https://relay.dev/docs/guides/persisted-queries/#local-persisted-queries).
+1. Use the `persisted-queries publish` command to publish the manifest to Apollo GraphOS. The command usage is the same as when publishing Apollo-generated manifests, but you must include the `--manifest-format relay` argument:
+
+```bash
+rover persisted-queries publish my-graph@my-variant \
+  --manifest ./persisted-queries.json \
+  --manifest-format relay
+```

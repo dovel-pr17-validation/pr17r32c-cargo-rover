@@ -1,0 +1,870 @@
+pub mod file_search;
+use std::{
+    borrow::Cow,
+    fs,
+    fs::OpenOptions,
+    io::{self, ErrorKind, Write},
+    path::PathBuf,
+    time::Duration,
+};
+
+use anyhow::{anyhow, Context};
+use camino::{ReadDirUtf8, Utf8Path, Utf8PathBuf};
+use encoding_rs::{Encoding, UTF_8};
+pub use file_search::FileSearch;
+#[cfg(windows)]
+use notify::event::{DataChange, ModifyKind};
+use notify::{Config, EventKind, PollWatcher, RecursiveMode, Watcher};
+use tap::TapFallible;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
+
+use crate::RoverStdError;
+
+/// Whether `path` is a symlink whose target does not exist.
+fn dangles(path: &Utf8Path) -> bool {
+    path.symlink_metadata().is_ok() && path.metadata().is_err()
+}
+
+/// The rate at which we poll files for changes
+const FS_POLLING_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Interact with a file system
+#[derive(Default, Copy, Clone)]
+pub struct Fs {}
+
+impl Fs {
+    /// reads a file from disk
+    pub fn read_file<P>(path: P) -> Result<String, RoverStdError>
+    where
+        P: AsRef<Utf8Path>,
+    {
+        let path = path.as_ref();
+        match fs::metadata(path) {
+            Ok(metadata) => {
+                if metadata.is_file() {
+                    tracing::info!("reading {} from disk", &path);
+                    let bytes =
+                        fs::read(path).with_context(|| format!("could not read {}", path))?;
+                    let contents = decode_to_string(&bytes)
+                        .with_context(|| format!("could not read {}", path))?;
+                    if contents.is_empty() {
+                        Err(RoverStdError::EmptyFile {
+                            empty_file: path.to_string(),
+                        })
+                    } else {
+                        Ok(contents)
+                    }
+                } else {
+                    Err(anyhow!("'{}' is not a file", path).into())
+                }
+            }
+            Err(e) => Err(anyhow!("could not find '{}'", path).context(e).into()),
+        }
+    }
+
+    /// Reads a file that may legitimately be absent: its bytes, or `None` if
+    /// there is nothing at `path`, or no directory for it to be in.
+    ///
+    /// Unlike [`Fs::read_file`], an empty file is not an error, the bytes are
+    /// not decoded, and a failure is the [`io::Error`] itself, so the caller
+    /// can say why the file couldn't be read. A symlink that points nowhere
+    /// is there, though, and is not absent, whether it is the file itself or
+    /// any directory on the way to it.
+    pub fn read_if_present<P>(path: P) -> io::Result<Option<Vec<u8>>>
+    where
+        P: AsRef<Utf8Path>,
+    {
+        let path = path.as_ref();
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
+                    && !path.ancestors().any(dangles) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// writes a file to disk
+    pub fn write_file<P, C>(path: P, contents: C) -> Result<(), RoverStdError>
+    where
+        P: AsRef<Utf8Path>,
+        C: AsRef<[u8]>,
+    {
+        let path = path.as_ref();
+        tracing::info!("checking existence of parent path in '{}'", path);
+
+        // Try and grab the last element of the path, which should be the file name, if we can't
+        // then we should bail out and throw that back to the user.
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("cannot write to a path without a final element {path}"))?;
+
+        // Grab the parent path then attempt to canonicalize it, we can't just canonicalize the
+        // entire path because that would entail the file existing, which of course it doesn't yet.
+        let parent = match path.parent() {
+            // A bare file name (e.g. `schema.graphql`) has an empty parent, which refers to the
+            // current directory. That always exists, so we mustn't try to create/canonicalize an
+            // empty path — doing so fails with "No such file or directory".
+            Some(parent) if parent.as_str().is_empty() => Utf8Path::new("."),
+            Some(parent) => parent,
+            None => return Err(anyhow!("cannot write file to root or prefix {path}").into()),
+        };
+        let mut canonical_final_path = Self::upsert_path_exists(parent)?;
+
+        // Create the final version of the path we want to create
+        canonical_final_path.push(file_name);
+
+        tracing::debug!("final canonical path is {}", canonical_final_path);
+        // Setup a file pointer
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "tried to open {} but was unable to do so",
+                    canonical_final_path
+                )
+            })?;
+        tracing::info!("writing {} to disk", &canonical_final_path);
+        // Actually write the file out to where it needs to be
+        file.write(contents.as_ref())
+            .with_context(|| format!("could not write {}", canonical_final_path))?;
+        Ok(())
+    }
+
+    /// Writes `contents` to `path`, replacing whatever is there, so that a
+    /// reader sees either the old file or the whole new one, never part of it.
+    ///
+    /// The contents go to a temporary file beside `path` that is then renamed
+    /// over it, so an interrupted write leaves the old file intact. Unlike
+    /// [`Fs::write_file`], the directory must already exist, since creating
+    /// one is a decision for the caller, and a failure is the [`io::Error`]
+    /// itself. On Unix the file is left readable by everyone and writable by
+    /// its owner (`0644`), not with the owner-only permissions a temporary
+    /// file is created with.
+    pub fn write_file_atomically<P, C>(path: P, contents: C) -> io::Result<()>
+    where
+        P: AsRef<Utf8Path>,
+        C: AsRef<[u8]>,
+    {
+        let path = path.as_ref();
+        // A bare file name has an empty parent, meaning the current directory.
+        let dir = path
+            .parent()
+            .filter(|dir| !dir.as_str().is_empty())
+            .unwrap_or_else(|| Utf8Path::new("."));
+
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(contents.as_ref())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o644))?;
+        }
+        file.persist(path).map_err(|error| error.error)?;
+
+        Ok(())
+    }
+
+    /// Given a path, where some elements may not exist, it will return the canonical
+    /// representation of the path, AND create any missing interim directories.
+    fn upsert_path_exists(path: &Utf8Path) -> Result<Utf8PathBuf, anyhow::Error> {
+        tracing::debug!("attempting to canonicalize parent path '{path}'");
+        if let Err(e) = path.canonicalize_utf8() {
+            match e.kind() {
+                ErrorKind::NotFound => {
+                    tracing::debug!("could not canonicalize parent path '{}', attempting to create interim paths", path);
+                    // If the canonicalization fails, then some part of the chain must not exist,
+                    // so we need to call create_dir_all to fix this
+                    Self::create_dir_all(path).with_context(|| {
+                        format!("{} does not exist and it could not be created", path)
+                    })?;
+                    tracing::debug!("interim paths created for {}", path);
+                }
+                ErrorKind::PermissionDenied => {
+                    return Err(anyhow::anyhow!(
+                        "cannot write file to path {} as user does not have permissions to do so",
+                        path
+                    ))
+                }
+                _ => {}
+            }
+        }
+        path.canonicalize_utf8().map_err(|e| anyhow!(e))
+    }
+
+    /// creates a directory
+    pub fn create_dir_all<P>(path: P) -> Result<(), RoverStdError>
+    where
+        P: AsRef<Utf8Path>,
+    {
+        let path = path.as_ref();
+        tracing::info!("creating {} directory", &path);
+        fs::create_dir_all(path).with_context(|| format!("could not create {} directory", path))?;
+        Ok(())
+    }
+
+    /// get contents of a directory
+    pub fn get_dir_entries<D>(dir: D) -> Result<ReadDirUtf8, RoverStdError>
+    where
+        D: AsRef<Utf8Path>,
+    {
+        let dir = dir.as_ref();
+        let entries = dir
+            .read_dir_utf8()
+            .with_context(|| format!("could not read entries of {dir}"))?;
+        Ok(entries)
+    }
+
+    /// assert that a file exists
+    pub fn assert_path_exists<F>(file: F) -> Result<(), RoverStdError>
+    where
+        F: AsRef<Utf8Path>,
+    {
+        let file = file.as_ref();
+        Self::metadata(file)?;
+        Ok(())
+    }
+
+    /// get metadata about a file path
+    pub fn metadata<F>(file: F) -> Result<fs::Metadata, RoverStdError>
+    where
+        F: AsRef<Utf8Path>,
+    {
+        let file = file.as_ref();
+        Ok(fs::metadata(file)
+            .with_context(|| format!("could not find a file at the path '{file}'"))?)
+    }
+
+    /// copies one file to another
+    pub fn copy<I, O>(in_path: I, out_path: O) -> Result<(), RoverStdError>
+    where
+        I: AsRef<Utf8Path>,
+        O: AsRef<Utf8Path>,
+    {
+        let in_path = in_path.as_ref();
+        let out_path = out_path.as_ref();
+        tracing::info!("copying {} to {}", in_path, out_path);
+        // attempt to remove the old file
+        // but do not error if it doesn't exist.
+        let _ = fs::remove_file(out_path);
+        fs::copy(in_path, out_path)
+            .with_context(|| format!("could not copy {} to {}", in_path, out_path))?;
+        Ok(())
+    }
+
+    /// recursively removes directories
+    pub fn remove_dir_all<D>(dir: D) -> Result<(), RoverStdError>
+    where
+        D: AsRef<Utf8Path>,
+    {
+        let dir = dir.as_ref();
+        if Self::path_is_dir(dir)? {
+            fs::remove_dir_all(dir).with_context(|| format!("could not remove {dir}"))?;
+            Ok(())
+        } else {
+            Err(anyhow!("could not remove {} because it is not a directory", dir).into())
+        }
+    }
+
+    /// checks if a path is a directory, errors if the path does not exist
+    pub fn path_is_dir<D>(dir: D) -> Result<bool, RoverStdError>
+    where
+        D: AsRef<Utf8Path>,
+    {
+        let dir = dir.as_ref();
+        Self::metadata(dir).map(|m| m.is_dir())
+    }
+
+    /// copies all contents from one directory to another
+    pub fn copy_dir_all<I, O>(in_dir: I, out_dir: O) -> Result<(), RoverStdError>
+    where
+        I: AsRef<Utf8Path>,
+        O: AsRef<Utf8Path>,
+    {
+        let in_dir = in_dir.as_ref();
+        let out_dir = out_dir.as_ref();
+        Self::create_dir_all(out_dir)?;
+        tracing::info!("copying contents of {} to {}", in_dir, out_dir);
+        for entry in (Self::get_dir_entries(in_dir)?).flatten() {
+            let entry_path = entry.path();
+            if let Ok(metadata) = fs::metadata(entry_path) {
+                if metadata.is_file() {
+                    if let Some(entry_name) = entry_path.file_name() {
+                        let out_file = out_dir.join(entry_name);
+                        tracing::info!("copying {} to {}", &entry_path, &out_file);
+                        fs::copy(entry_path, &out_file).with_context(|| {
+                            format!("could not copy {} to {}", entry_path, out_file)
+                        })?;
+                    }
+                } else if metadata.is_dir() && entry_path != in_dir {
+                    if let Some(entry_name) = entry_path.file_name() {
+                        let out_dir = out_dir.join(entry_name);
+                        tracing::info!("copying {} to {}", &entry_path, &out_dir);
+                        Fs::copy_dir_all(entry_path, &out_dir)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawns a file watcher for a given file, sending events over the channel whenever the file
+    /// should be re-read. This is primarily used for composition and so the event emitted is a
+    /// unit struct. The caller should react to that event as representing a reason to recompose.
+    ///
+    /// Example:
+    ///
+    /// ```ignore
+    /// let path = "./test.txt";
+    /// let (file_tx, file_rx) = tokio::sync::mypsc::unbounded_channel();
+    /// let cancellation_token = Fs::watch_file(path.clone(), file_tx);
+    ///
+    /// tokio::spawn(move || {
+    ///     while let Some(event) = file_rx.await {
+    ///         // do something
+    ///     }
+    /// });
+    ///
+    /// // Cancel and close the watcher
+    /// cancellation_token.cancel();
+    /// ```
+    pub fn watch_file(
+        path: PathBuf,
+        tx: UnboundedSender<Result<(), RoverStdError>>,
+        cancellation_token: Option<CancellationToken>,
+    ) -> CancellationToken {
+        let cancellation_token = cancellation_token.unwrap_or_default();
+
+        let poll_watcher = PollWatcher::new(
+            {
+                let path = path.clone();
+
+                move |result: Result<notify::Event, notify::Error>| {
+                    // This is an early check that the file exists and that we have the right
+                    // permissions for it
+                    //
+                    // Development note: this should only be trusted for telling us that the file
+                    // either doesn't exist or that we don't have the right permissions, it shouldn't
+                    // be used as the final say in whether the file _should_ exist because some
+                    // platforms (eg, Windows) might keep the file around after the user has already
+                    // removed it. The event handling below should be the final say by capturing events
+                    // relevant to the lifecycle of a file (though, see the notes below for why we
+                    // should also be cautious with that )
+                    if let Err(err) = std::fs::metadata(&path) {
+                        tracing::error!(
+                        "When checking that {path:?} exists with the right permissions: {err:?}" //"When checking that {boxed_path} exists with the right permissions: {err:?}"
+                    );
+                        let _ = tx.send(Err(RoverStdError::FileRemoved {
+                            file: path.display().to_string(),
+                        }));
+                        return;
+                    }
+
+                    let event = match result {
+                        Err(err) => {
+                            tracing::error!("Something went wrong watching {path:?}: {err:?}");
+                            let _ = tx.send(Err(RoverStdError::FileRemoved {
+                                file: path.display().to_string(),
+                            }));
+                            return;
+                        }
+                        Ok(event) => event,
+                    };
+
+                    match event.kind {
+                        // For changes, Windows emits Modify(Metadata(WriteTime)); for file removals,
+                        // we only get the catch-all event Modify(Data(Any)). Annoyingly, the
+                        // std::fs::metadata() check above passes for windows
+                        #[cfg(windows)]
+                        EventKind::Modify(ModifyKind::Data(DataChange::Any)) => {
+                            match std::fs::metadata(&path) {
+                                Ok(_metadata) => {
+                                    if fs::exists(&path).unwrap_or_default() {
+                                        tracing::debug!(
+                                            "received a modify event for windows, but file exists"
+                                        );
+                                        let _ = tx.send(Ok(())).tap_err(|_| {
+                            tracing::error!("Unable to send to filewatcher receiver because it closed. File being watched: {path:?}");
+                                        });
+                                    }
+
+                                    let _ = tx.send(Err(RoverStdError::FileRemoved {
+                                        file: path.display().to_string(),
+                                    }));
+                                    return;
+                                }
+                                Err(_err) => {
+                                    let _ = tx.send(Err(RoverStdError::FileRemoved {
+                                        file: path.display().to_string(),
+                                    }));
+                                    return;
+                                }
+                            }
+                        }
+                        EventKind::Modify(_) => {
+                            let _ = tx.send(Ok(())).tap_err(|_| {
+                            tracing::error!("Unable to send to filewatcher receiver because it closed. File being watched: {path:?}");
+                        });
+                        }
+                        unsupported_event_kind => {
+                            tracing::debug!("Ignoring an unsupported event while file watching {path:?}. Unsupported event kind: {unsupported_event_kind:?}\n\nEvent: {event:?}");
+                        }
+                    }
+                }
+            },
+            Config::default()
+                // By polling at an interval, we get built-in debouncing
+                .with_poll_interval(FS_POLLING_INTERVAL)
+                // Development note: this makes polling work for pseudo filesystems like tempfs;
+                // but, there is a performance cost
+                .with_compare_contents(true),
+        );
+
+        let cancellation_token_c = cancellation_token.clone();
+
+        tokio::task::spawn({
+            async move {
+                match poll_watcher {
+                    Ok(mut poll_watcher) => {
+                        // Internally, watch() starts a synchronous loop in a background thread
+                        // that only stops when poll_watcher gets dropped
+                        let _ = poll_watcher.watch(&path, RecursiveMode::NonRecursive);
+                        // To keep poll_watcher from getting dropped, we wait on the cancellation
+                        // token to be used. When it's used, this tokio task will end, dropping the
+                        // fn, and thereby dropping the poll_watcher and ending the background
+                        // thread's synchronous loop
+                        cancellation_token_c.cancelled().await;
+                        tracing::debug!("Dropping file watcher for: {:?}", path);
+                    }
+                    // If we fail to watch the file for some reason, don't panic, but let the user know
+                    // that something went wrong
+                    //
+                    // Development note: eventually, we'll probably want to return a
+                    // Result<CancellationToken, RoverStdErr> and let the caller deal with errors.
+                    // Previously, we used Options to denote the existence of a watcher
+                    Err(err) => {
+                        tracing::error!(
+                            "Something went wrong when trying to watch {path:?}: {err:?}"
+                        );
+                    }
+                };
+            }
+        });
+
+        cancellation_token
+    }
+}
+
+/// Decodes raw file bytes into a UTF-8 `String`, honoring a leading byte-order
+/// mark.
+///
+/// Files saved as UTF-16 are losslessly transcoded to UTF-8 rather than rejected,
+/// and any BOM is stripped.
+fn decode_to_string(bytes: &[u8]) -> anyhow::Result<String> {
+    let (encoding, bom_len) = Encoding::for_bom(bytes).unwrap_or((UTF_8, 0));
+    encoding
+        .decode_without_bom_handling_and_without_replacement(&bytes[bom_len..])
+        .map(Cow::into_owned)
+        .ok_or_else(|| anyhow!("stream did not contain valid {}", encoding.name()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use anyhow::Result;
+    use camino::Utf8PathBuf;
+    use rstest::rstest;
+    use speculoos::prelude::*;
+    use tempfile::{NamedTempFile, TempDir};
+    use tokio::{
+        sync::{mpsc::unbounded_channel, Mutex},
+        time::sleep,
+    };
+
+    use super::*;
+
+    const BOM: char = '\u{FEFF}';
+
+    fn utf16_bytes(s: &str, little_endian: bool) -> Vec<u8> {
+        s.encode_utf16()
+            .flat_map(|unit| {
+                if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn decode_plain_utf8() {
+        let sdl = "type Query { hello: String }";
+        assert_eq!(decode_to_string(sdl.as_bytes()).unwrap(), sdl);
+    }
+
+    #[test]
+    fn decode_strips_utf8_bom() {
+        let sdl = "type Query { hello: String }";
+        let bytes = format!("{BOM}{sdl}").into_bytes(); // UTF-8, BOM-prefixed
+        assert_eq!(decode_to_string(&bytes).unwrap(), sdl);
+    }
+
+    #[test]
+    fn decode_transcodes_utf16le_with_bom_and_crlf() {
+        // What PowerShell's `rover graph introspect > schema.gql` produces.
+        let sdl = "type Query { hello: String }\r\n";
+        let bytes = utf16_bytes(&format!("{BOM}{sdl}"), true);
+        assert_eq!(decode_to_string(&bytes).unwrap(), sdl);
+    }
+
+    #[test]
+    fn decode_transcodes_utf16be_with_bom() {
+        let sdl = "schema { query: Query }";
+        let bytes = utf16_bytes(&format!("{BOM}{sdl}"), false);
+        assert_eq!(decode_to_string(&bytes).unwrap(), sdl);
+    }
+
+    #[test]
+    fn decode_rejects_invalid_utf8_without_bom() {
+        // Lone continuation bytes, no BOM -> still surfaces the UTF-8 error.
+        assert!(decode_to_string(&[0x80, 0x81]).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_odd_length_utf16() {
+        let mut bytes = utf16_bytes(&BOM.to_string(), true); // just the BOM (FF FE)
+        bytes.push(0x41); // single trailing byte -> odd length
+        assert!(decode_to_string(&bytes).is_err());
+    }
+
+    #[rstest]
+    #[case("a/b/c", "a/b/c/supergraph.yaml", vec!(), false)]
+    #[case("a/b", "a/b/c/supergraph.yaml", vec!(), false)]
+    #[case("/", "supergraph.yaml", vec!(), false)]
+    #[case("/", "/", vec!(), true)]
+    #[case("/", "abc/def", vec!("abc".to_string()), true)]
+    #[case("abc", "abc/def/pqr", vec!("abc/def".to_string()), true)]
+    #[case("/", "abc/../abc/def/supergraph.yaml", vec!(), false)]
+    fn test_write_file(
+        #[case] existing_path: &str,
+        #[case] path_to_create: &str,
+        #[case] existing_files: Vec<String>,
+        #[case] error_expected: bool,
+    ) {
+        // Set up a temporary directory as required
+        let bounding_dir = TempDir::new()
+            .expect("failed to create temporary directory")
+            .keep();
+        let mut path =
+            Utf8PathBuf::from_path_buf(bounding_dir.clone()).expect("could not create UTF8-Path");
+        let mut expected_path = path.clone();
+        path.push(existing_path);
+        // Create all the existing directories
+        fs::create_dir_all(path).expect("could not set up test conditions");
+        // Create any pre-existing files
+        for file_to_create in existing_files.iter() {
+            let mut file_to_write = Utf8PathBuf::from_path_buf(bounding_dir.clone())
+                .expect("could not create UTF8-Path to file to create");
+            file_to_write.push(file_to_create);
+            fs::write(file_to_write, "blah, blah, blah").expect("could not write to file");
+        }
+
+        // Invoke the method to create the files
+        expected_path.push(path_to_create);
+        let res = Fs::write_file(expected_path.clone(), "foo, bar, bash");
+        // Run assertions on the result
+        if error_expected {
+            assert_that(&res).is_err();
+        } else {
+            assert_that(&res).is_ok();
+            assert_that(&expected_path).exists()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_watch_file() -> Result<()> {
+        // create a temporary file that we'll make changes to for events to be watched
+        let mut file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+        let (tx, rx) = unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let cancellation_token = Fs::watch_file(path.clone(), tx, None);
+
+        sleep(Duration::from_millis(1500)).await;
+
+        // assert that no events have been emitted yet
+        {
+            let rx = rx.lock().await;
+            assert_that!(rx.is_empty()).is_true();
+        }
+
+        // do a change that'll emit an event
+        file.write_all(b"some update")?;
+        file.flush()?;
+
+        let mut writeable_file = OpenOptions::new().write(true).truncate(true).open(path)?;
+        writeable_file.write_all("some change".as_bytes())?;
+        let result = tokio::time::timeout(Duration::from_millis(2000), {
+            let rx = rx.clone();
+            async move {
+                let mut output = None;
+                let mut rx = rx.lock().await;
+                if let Some(message) = rx.recv().await {
+                    output = Some(message);
+                }
+                output
+            }
+        })
+        .await;
+
+        assert_that!(result)
+            .is_ok()
+            .is_some()
+            .is_ok()
+            .is_equal_to(());
+
+        {
+            let rx = rx.lock().await;
+            assert_that!(rx.is_closed()).is_false();
+        }
+
+        sleep(Duration::from_millis(1000)).await;
+        cancellation_token.cancel();
+
+        sleep(Duration::from_millis(1000)).await;
+
+        {
+            let rx = rx.lock().await;
+            assert_that!(rx.is_closed()).is_true();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_watcher_shutdown_on_file_removed() -> Result<()> {
+        // create a temporary file that we'll make changes to for events to be watched
+        let mut file = NamedTempFile::new()?;
+        let path = file.path().to_path_buf();
+
+        let (tx, rx) = unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+
+        let _cancellation_token = Fs::watch_file(path.clone(), tx, None);
+
+        sleep(Duration::from_millis(1500)).await;
+
+        // assert that no events have been emitted yet
+        {
+            let rx = rx.lock().await;
+            assert_that!(rx.is_empty()).is_true();
+        }
+
+        // do a change that'll emit an event
+        file.write_all(b"some update")?;
+        file.flush()?;
+
+        let mut writeable_file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path.clone())?;
+
+        writeable_file.write_all("some change".as_bytes())?;
+
+        let result = tokio::time::timeout(Duration::from_millis(2000), {
+            let rx = rx.clone();
+            async move {
+                let mut output = None;
+                let mut rx = rx.lock().await;
+                if let Some(message) = rx.recv().await {
+                    output = Some(message);
+                }
+                output
+            }
+        })
+        .await;
+
+        assert_that!(result)
+            .is_ok()
+            .is_some()
+            .is_ok()
+            .is_equal_to(());
+
+        {
+            let rx = rx.lock().await;
+            assert_that!(rx.is_closed()).is_false();
+        }
+
+        file.close()?;
+
+        let result = tokio::time::timeout(Duration::from_millis(4000), {
+            let rx = rx.clone();
+            async move {
+                let mut output = None;
+                let mut rx = rx.lock().await;
+                if let Some(message) = rx.recv().await {
+                    output = Some(message);
+                }
+                output
+            }
+        })
+        .await;
+
+        assert_that!(result)
+            .is_ok()
+            .is_some()
+            .is_err()
+            .matches(|err| {
+                // Ugly string comparison; if we ever make RoverStdError PartialEq, change this
+                // (conflicts with anyhow)
+                err.to_string()
+                    == RoverStdError::FileRemoved {
+                        file: path.display().to_string(),
+                    }
+                    .to_string()
+            });
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_file_atomically_tests {
+    use camino::Utf8PathBuf;
+    use rstest::rstest;
+    use speculoos::prelude::*;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn temp_dir() -> (TempDir, Utf8PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let root = Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        (temp, root)
+    }
+
+    fn listing(dir: &Utf8Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
+    }
+
+    #[rstest]
+    fn writing_replaces_the_file_and_leaves_nothing_else_behind() {
+        let (_temp, root) = temp_dir();
+        let path = root.join("file");
+        Fs::write_file_atomically(&path, "old").unwrap();
+
+        Fs::write_file_atomically(&path, "new").unwrap();
+
+        assert_that!(fs::read_to_string(&path).unwrap()).is_equal_to("new".to_string());
+        assert_that!(listing(&root)).is_equal_to(vec!["file".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    fn a_written_file_is_readable_by_everyone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_temp, root) = temp_dir();
+        let path = root.join("file");
+
+        Fs::write_file_atomically(&path, "contents").unwrap();
+
+        assert_that!(fs::metadata(&path).unwrap().permissions().mode() & 0o777).is_equal_to(0o644);
+    }
+
+    #[rstest]
+    fn a_missing_directory_is_an_error_and_is_not_created() {
+        let (_temp, root) = temp_dir();
+
+        let error = Fs::write_file_atomically(root.join("missing").join("file"), "contents")
+            .expect_err("should not write");
+
+        assert_that!(error.kind()).is_equal_to(ErrorKind::NotFound);
+        assert_that!(root.join("missing").exists()).is_false();
+    }
+}
+
+#[cfg(test)]
+mod read_if_present_tests {
+    use camino::Utf8PathBuf;
+    use rstest::rstest;
+    use speculoos::prelude::*;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn temp_dir() -> (TempDir, Utf8PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let root = Utf8PathBuf::try_from(temp.path().to_path_buf()).unwrap();
+        (temp, root)
+    }
+
+    #[rstest]
+    #[case::a_file(b"version = 1\n".as_slice())]
+    #[case::an_empty_file(b"".as_slice())]
+    #[case::bytes_that_are_not_text(b"\xff\xfe".as_slice())]
+    fn a_file_that_is_there_is_read_as_it_is(#[case] contents: &[u8]) {
+        let (_temp, root) = temp_dir();
+        let path = root.join("file");
+        fs::write(&path, contents).unwrap();
+
+        assert_that!(Fs::read_if_present(&path))
+            .is_ok()
+            .is_equal_to(Some(contents.to_vec()));
+    }
+
+    #[rstest]
+    #[case::nothing_there("file")]
+    #[case::no_directory_for_it("missing/file")]
+    fn a_file_that_is_not_there_is_absent(#[case] relative: &str) {
+        let (_temp, root) = temp_dir();
+
+        assert_that!(Fs::read_if_present(root.join(relative)))
+            .is_ok()
+            .is_none();
+    }
+
+    #[rstest]
+    fn a_file_below_a_file_is_absent() {
+        let (_temp, root) = temp_dir();
+        fs::write(root.join("dir"), "").unwrap();
+
+        assert_that!(Fs::read_if_present(root.join("dir").join("file")))
+            .is_ok()
+            .is_none();
+    }
+
+    #[rstest]
+    fn a_directory_is_not_a_file_that_is_absent() {
+        let (_temp, root) = temp_dir();
+        fs::create_dir(root.join("file")).unwrap();
+
+        assert_that!(Fs::read_if_present(root.join("file"))).is_err();
+    }
+
+    // Creating a symlink on Windows needs a privilege a test cannot count on.
+    #[cfg(unix)]
+    #[rstest]
+    #[case::the_file_itself("file", "file")]
+    #[case::a_directory_on_the_way("dir", "dir/file")]
+    fn a_symlink_that_points_nowhere_is_not_absent(#[case] link: &str, #[case] read: &str) {
+        let (_temp, root) = temp_dir();
+        std::os::unix::fs::symlink(root.join("moved"), root.join(link)).unwrap();
+
+        let error = Fs::read_if_present(root.join(read)).expect_err("should not be absent");
+
+        assert_that!(error.kind()).is_equal_to(ErrorKind::NotFound);
+    }
+}

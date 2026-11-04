@@ -1,0 +1,731 @@
+use std::collections::BTreeMap;
+
+use apollo_federation_types::config::FederationVersion;
+use buildstructor::Builder;
+use camino::Utf8PathBuf;
+use futures::stream::BoxStream;
+use rover_print::{print::Print, style::StyledText};
+use rover_std::{errln, infoln, warnln};
+use tap::TapFallible;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info};
+
+use crate::{
+    command::install::{Plugin, PluginProvenance},
+    composition::{
+        CompositionError,
+        CompositionError::ResolvingSubgraphsError,
+        CompositionSubgraphAdded, CompositionSubgraphRemoved, CompositionSuccess,
+        FederationUpdaterConfig,
+        events::CompositionEvent,
+        supergraph::{
+            binary::SupergraphBinary,
+            config::{
+                error::ResolveSubgraphError, full::FullyResolvedSupergraphConfig,
+                resolver::ResolveSupergraphConfigError,
+            },
+            install::{InstallSupergraph, InstallSupergraphError},
+        },
+        watchers::{
+            composition::CompositionInputEvent::{
+                Federation, Passthrough, Recompose, Subgraph, SubgraphBatch,
+            },
+            subgraphs::SubgraphEvent,
+        },
+    },
+    config::SupergraphConfigYaml,
+    federation::reject_federation_one,
+    plugin::{
+        error::RequestOrigin,
+        layering::LayeredDeclarations,
+        precedence::{ManifestOverridden, PluginRequest, RequestSource},
+        version::PluginName,
+    },
+    subtask::SubtaskHandleStream,
+    utils::effect::{exec::ExecCommand, install::InstallBinary, write_file::WriteFile},
+};
+
+/// Event to represent an input to the CompositionWatcher, depending on the source the event comes
+/// from. This is really like a Union type over multiple disparate events
+pub enum CompositionInputEvent {
+    /// A single change to one subgraph
+    Subgraph(SubgraphEvent),
+    /// A collection of subgraph changes that all originate from the same supergraph.yaml
+    /// change and must compose as a single unit
+    SubgraphBatch(Vec<SubgraphEvent>),
+    /// Variant to represent if the change comes from a change in the Federation Version
+    Federation(FederationVersion),
+    /// Variant to represent if we need to recompose quickly without other changes
+    Recompose(),
+    /// Variant to something that we do not want to perform Composition on but needs to be passed
+    /// through to the final stream of Composition Events.
+    Passthrough(CompositionEvent),
+}
+
+/// Apply a single subgraph event to the in-memory supergraph config and emit
+/// any user-visible side-effect events. Returns `true` when the change should
+/// trigger a recomposition.
+fn apply_subgraph_event(
+    sg_event: SubgraphEvent,
+    supergraph_config: &mut FullyResolvedSupergraphConfig,
+    sender: &UnboundedSender<CompositionEvent>,
+) -> bool {
+    match sg_event {
+        SubgraphEvent::SubgraphSchemaChanged(subgraph_schema_changed) => {
+            let name = subgraph_schema_changed.name().clone();
+            let schema_source = subgraph_schema_changed.schema_source().clone();
+            let message = format!("Schema change detected for subgraph: {}", name);
+            infoln!("{}", message);
+            tracing::info!(message);
+            if supergraph_config
+                .update_subgraph_schema(name.clone(), subgraph_schema_changed.into())
+                .is_none()
+            {
+                let _ = sender
+                    .send(CompositionEvent::SubgraphAdded(CompositionSubgraphAdded {
+                        name,
+                        schema_source,
+                    }))
+                    .tap_err(|err| error!("{:?}", err));
+            }
+            true
+        }
+        SubgraphEvent::RoutingUrlChanged(routing_url_changed) => {
+            let name = routing_url_changed.name();
+            info!("Change of routing_url detected for subgraph '{}'", name);
+            supergraph_config
+                .update_routing_url(name, routing_url_changed.routing_url().clone())
+                .is_some()
+        }
+        SubgraphEvent::SubgraphRemoved(subgraph_removed) => {
+            let name = subgraph_removed.name();
+            let resolution_error = subgraph_removed.resolution_error().clone();
+            info!("Subgraph removed: {}", name);
+            supergraph_config.remove_subgraph(name);
+            let _ = sender
+                .send(CompositionEvent::SubgraphRemoved(
+                    CompositionSubgraphRemoved {
+                        name: name.clone(),
+                        resolution_error,
+                    },
+                ))
+                .tap_err(|err| error!("{:?}", err));
+            true
+        }
+    }
+}
+
+#[derive(Builder, Debug)]
+pub struct CompositionWatcher<ExecC, WriteF> {
+    initial_supergraph_config: FullyResolvedSupergraphConfig,
+    initial_resolution_errors: BTreeMap<String, ResolveSubgraphError>,
+    federation_updater_config: Option<FederationUpdaterConfig>,
+    /// The manifests' declarations, so that a `federation_version` added to
+    /// `supergraph.yaml` mid-session that overrides one can say so (FR30).
+    manifest_declarations: Option<LayeredDeclarations>,
+    supergraph_binary: Result<SupergraphBinary, InstallSupergraphError>,
+    exec_command: ExecC,
+    write_file: WriteF,
+    temp_dir: Utf8PathBuf,
+    compose_on_initialisation: bool,
+}
+
+impl<ExecC, WriteF> SubtaskHandleStream for CompositionWatcher<ExecC, WriteF>
+where
+    ExecC: ExecCommand + Send + Sync + 'static,
+    WriteF: WriteFile + Send + Sync + 'static,
+{
+    type Input = CompositionInputEvent;
+    type Output = CompositionEvent;
+
+    fn handle(
+        mut self,
+        sender: UnboundedSender<Self::Output>,
+        mut input: BoxStream<'static, Self::Input>,
+        cancellation_token: Option<CancellationToken>,
+    ) {
+        tokio::task::spawn(async move {
+            let mut supergraph_config = self.initial_supergraph_config.clone();
+            let target_file = self.temp_dir.join("supergraph.yaml");
+
+            match (
+                self.initial_resolution_errors.is_empty(),
+                self.compose_on_initialisation,
+            ) {
+                (true, true) => {
+                    if let Err(err) = self
+                        .setup_temporary_supergraph_yaml(&supergraph_config, &target_file)
+                        .await
+                    {
+                        error!("Could not setup initial supergraph schema: {}", err);
+                    };
+                    let _ = sender
+                        .send(CompositionEvent::Started)
+                        .tap_err(|err| error!("{:?}", err));
+                    let output = self.run_composition(&target_file).await;
+                    match output {
+                        Ok(success) => {
+                            let _ = sender
+                                .send(CompositionEvent::Success(success))
+                                .tap_err(|err| error!("{:?}", err));
+                        }
+                        Err(err) => {
+                            let _ = sender
+                                .send(CompositionEvent::Error(err))
+                                .tap_err(|err| error!("{:?}", err));
+                        }
+                    }
+                }
+                (false, _) => {
+                    let _ = sender
+                        .send(CompositionEvent::Error(ResolvingSubgraphsError {
+                            source: ResolveSupergraphConfigError::ResolveSubgraphs(
+                                self.initial_resolution_errors.clone(),
+                            ),
+                            provenance: self.resolved_provenance(),
+                        }))
+                        .tap_err(|err| error!("{:?}", err));
+                }
+                (true, false) => {}
+            };
+
+            let cancellation_token = cancellation_token.unwrap_or_default();
+            cancellation_token.run_until_cancelled(async {
+                while let Some(event) = input.next().await {
+                    match event {
+                        Subgraph(sg_event) => {
+                            if !apply_subgraph_event(sg_event, &mut supergraph_config, &sender) {
+                                continue;
+                            }
+                        },
+                        SubgraphBatch(sg_events) => {
+                            let mut subgraph_changed = false;
+                            for sg_event in sg_events {
+                                if apply_subgraph_event(sg_event, &mut supergraph_config, &sender) {
+                                    subgraph_changed = true;
+                                }
+                            }
+                            if !subgraph_changed {
+                                continue;
+                            }
+                        },
+                        Federation(fed_version) => {
+                            if let Some(federation_updater_config) = self.federation_updater_config.clone() {
+                                if let Err(err) = reject_federation_one(&fed_version) {
+                                    let _ = sender.send(CompositionEvent::Error(err.into())).tap_err(|err| error!("{:?}", err));
+                                    continue;
+                                }
+                                let config_path = supergraph_config.origin_path().clone();
+                                if let Some(declarations) = &self.manifest_declarations {
+                                    ManifestOverridden::process().warn_once(
+                                        &rover_print::print::stderr::default(),
+                                        &PluginRequest {
+                                            plugin: PluginName::Supergraph,
+                                            request: Plugin::Supergraph(fed_version.clone()).request(),
+                                            source: RequestSource::SupergraphConfig(config_path),
+                                        },
+                                        declarations,
+                                    );
+                                }
+                                info!("Attempting to change supergraph version to {:?}", fed_version);
+                                infoln!("Attempting to change supergraph version to {}", fed_version);
+                                let install_res =
+                                    InstallSupergraph::new(fed_version, federation_updater_config.studio_client_config.clone())
+                                        .requested_by(Some(RequestOrigin::SupergraphConfig(supergraph_config.origin_path().clone())))
+                                        .install(federation_updater_config.override_install_path.clone(), federation_updater_config.elv2_licence_accepter, federation_updater_config.skip_update)
+                                        .await;
+                                match install_res {
+                                    Ok(supergraph_binary) => {
+                                        tracing::info!("Supergraph version changed to {:?}", supergraph_binary.version());
+                                        infoln!("Supergraph version changed to {}", supergraph_binary.version().to_string());
+                                        // A changed version is, by construction, new information worth
+                                        // reprinting (FR56) — this arm only runs when the version actually
+                                        // changed.
+                                        rover_print::print::stderr::default().print(&StyledText::plain(
+                                            supergraph_binary.provenance().to_string(),
+                                        ));
+                                        self.supergraph_binary = Ok(supergraph_binary)
+                                    }
+                                    Err(err) => {
+                                        tracing::warn!("Failed to change supergraph version, current version has been retained...");
+                                        warnln!("Failed to change supergraph version, current version has been retained...");
+                                        let _ = sender.send(CompositionEvent::Error(err.into())).tap_err(|err| error!("{:?}", err));
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                tracing::warn!("Detected Federation Version change but due to overrides (CLI flags, ENV vars etc.) this was not actioned.")
+                            }
+                        },
+                        // Empty because we just want to recompose what exists, not do anything else
+                        Recompose() => {},
+                        Passthrough(ev) => {
+                            let _ = sender.send(ev).tap_err(|err| error!("{:?}", err));
+                            continue;
+                        }
+                    }
+
+                    if let Err(err) = self
+                        .setup_temporary_supergraph_yaml(&supergraph_config, &target_file)
+                        .await
+                    {
+                        error!("Could not setup supergraph schema: {}", err);
+                        continue;
+                    };
+
+                    let _ = sender
+                        .send(CompositionEvent::Started)
+                        .tap_err(|err| error!("{:?}", err));
+
+                    let output = self
+                        .run_composition(&target_file)
+                        .await;
+
+                    match output {
+                        Ok(success) => {
+                            infoln!("Composition successful.");
+                            let _ = sender
+                                .send(CompositionEvent::Success(success))
+                                .tap_err(|err| error!("{:?}", err));
+                        }
+                        Err(err) => {
+                            errln!("Composition failed.");
+                            let _ = sender
+                                .send(CompositionEvent::Error(err))
+                                .tap_err(|err| error!("{:?}", err));
+                        }
+                    }
+                }
+            }).await;
+        });
+    }
+}
+
+impl<ExecC, WriteF> CompositionWatcher<ExecC, WriteF>
+where
+    ExecC: 'static + ExecCommand + Send + Sync,
+    WriteF: 'static + Send + Sync + WriteFile,
+{
+    /// The plugin this session currently has, if it has one. A session that has
+    /// not resolved one reports no plugin (FR57); one that has says so on every
+    /// error, matching the FR54 line it has already printed.
+    fn resolved_provenance(&self) -> Option<Box<PluginProvenance>> {
+        self.supergraph_binary
+            .as_ref()
+            .ok()
+            .map(|binary| binary.provenance().boxed())
+    }
+
+    async fn setup_temporary_supergraph_yaml(
+        &self,
+        supergraph_config: &FullyResolvedSupergraphConfig,
+        target_file: &Utf8PathBuf,
+    ) -> Result<(), CompositionError> {
+        let supergraph_config = SupergraphConfigYaml::from(supergraph_config.clone());
+        let supergraph_config_yaml = serde_yaml::to_string(&supergraph_config);
+
+        let supergraph_config_yaml = match supergraph_config_yaml {
+            Ok(supergraph_config_yaml) => supergraph_config_yaml,
+            Err(err) => {
+                errln!("Failed to serialize supergraph config into yaml");
+                error!("{:?}", err);
+                return Err(CompositionError::SerdeYaml {
+                    source: err,
+                    provenance: self.resolved_provenance(),
+                });
+            }
+        };
+
+        let write_file_result = self
+            .write_file
+            .write_file(target_file, supergraph_config_yaml.as_bytes())
+            .await;
+
+        if let Err(err) = write_file_result {
+            errln!("Failed to write the supergraph config to disk");
+            error!("{:?}", err);
+            Err(CompositionError::WriteFile {
+                path: target_file.clone(),
+                error: Box::new(err),
+                provenance: self.resolved_provenance(),
+            })
+        } else {
+            Ok(())
+        }
+    }
+    async fn run_composition(
+        &self,
+        target_file: &Utf8PathBuf,
+    ) -> Result<CompositionSuccess, CompositionError> {
+        match &self.supergraph_binary {
+            Ok(binary) => {
+                binary
+                    .compose(&self.exec_command, target_file.clone())
+                    .await
+            }
+            Err(err) => Err(CompositionError::InstallSupergraphBinaryError {
+                source: err.clone(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        process::{ExitStatus, Output},
+        str::FromStr,
+    };
+
+    use anyhow::Result;
+    use apollo_federation_types::config::{FederationVersion, SchemaSource};
+    use camino::Utf8PathBuf;
+    use futures::{
+        StreamExt,
+        stream::{BoxStream, once},
+    };
+    use houston::Config;
+    use mockall::predicate;
+    use rstest::rstest;
+    use semver::Version;
+    use speculoos::prelude::*;
+    use tokio_util::sync::CancellationToken;
+    use tracing_test::traced_test;
+
+    use super::{CompositionInputEvent, CompositionWatcher};
+    use crate::{
+        command::install::{PluginLevel, PluginProvenance, PluginSource},
+        composition::{
+            CompositionError, CompositionSubgraphAdded, FederationUpdaterConfig,
+            events::CompositionEvent,
+            supergraph::{
+                binary::SupergraphBinary, config::full::FullyResolvedSupergraphConfig,
+                version::SupergraphVersion,
+            },
+            test::{default_composition_json, default_composition_success},
+            watchers::{
+                composition::CompositionInputEvent::Subgraph,
+                subgraphs::{SubgraphEvent, SubgraphSchemaChanged},
+            },
+        },
+        options::LicenseAccepter,
+        subtask::{Subtask, SubtaskRunStream},
+        utils::{
+            client::{ClientBuilder, ClientTimeout, StudioClientConfig},
+            effect::{exec::MockExecCommand, read_file::MockReadFile, write_file::MockWriteFile},
+        },
+    };
+
+    fn test_provenance() -> PluginProvenance {
+        PluginProvenance::new(
+            "supergraph",
+            Version::from_str("2.8.0").unwrap(),
+            PluginSource::Installed,
+            PluginLevel::Global,
+            Utf8PathBuf::from_str("some/binary").unwrap(),
+        )
+    }
+
+    #[rstest]
+    #[case::success(false, serde_json::to_string(&default_composition_json()).unwrap())]
+    #[case::error(true, "invalid".to_string())]
+    #[traced_test]
+    #[tokio::test]
+    async fn test_runcomposition_handle(
+        #[case] composition_error: bool,
+        #[case] composition_output: String,
+    ) -> Result<()> {
+        let temp_dir = assert_fs::TempDir::new()?;
+        let temp_dir_path = Utf8PathBuf::from_path_buf(temp_dir.to_path_buf()).unwrap();
+
+        let federation_version = Version::from_str("2.8.0").unwrap();
+
+        let subgraphs = FullyResolvedSupergraphConfig::builder()
+            .subgraphs(BTreeMap::new())
+            .federation_version(FederationVersion::ExactFedTwo(federation_version.clone()))
+            .build();
+        let supergraph_version = SupergraphVersion::new(federation_version.clone());
+
+        let supergraph_binary = SupergraphBinary::builder()
+            .version(supergraph_version)
+            .exe(Utf8PathBuf::from_str("some/binary").unwrap())
+            .provenance(test_provenance())
+            .build();
+
+        let subgraph_name = "subgraph-name".to_string();
+        let subgraph_sdl = "type Query { test: String! }".to_string();
+
+        let mut mock_exec = MockExecCommand::new();
+        mock_exec
+            .expect_exec_command()
+            .times(1)
+            .returning(move |_| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: composition_output.as_bytes().into(),
+                    stderr: Vec::default(),
+                })
+            });
+
+        let mut mock_read_file = MockReadFile::new();
+        mock_read_file.expect_read_file().times(0);
+
+        let expected_supergraph_sdl = format!(
+            indoc::indoc! {
+                r#"subgraphs:
+                     {}:
+                       routing_url: https://example.com
+                       schema:
+                         sdl: '{}'
+                   federation_version: ={}
+"#
+            },
+            subgraph_name, subgraph_sdl, federation_version
+        );
+        let expected_supergraph_sdl_bytes = expected_supergraph_sdl.into_bytes();
+
+        let mut mock_write_file = MockWriteFile::new();
+        mock_write_file
+            .expect_write_file()
+            .times(1)
+            .with(
+                predicate::eq(temp_dir_path.join("supergraph.yaml")),
+                predicate::eq(expected_supergraph_sdl_bytes),
+            )
+            .returning(|_, _| Ok(()));
+
+        let composition_handler = CompositionWatcher::builder()
+            .initial_supergraph_config(subgraphs)
+            .supergraph_binary(Ok(supergraph_binary))
+            .exec_command(mock_exec)
+            .write_file(mock_write_file)
+            .temp_dir(temp_dir_path)
+            .compose_on_initialisation(false)
+            .build();
+
+        let subgraph_change_events: BoxStream<CompositionInputEvent> = once(async {
+            Subgraph(SubgraphEvent::SubgraphSchemaChanged(
+                SubgraphSchemaChanged::new(
+                    subgraph_name,
+                    subgraph_sdl.clone(),
+                    "https://example.com".to_string(),
+                    SchemaSource::Sdl { sdl: subgraph_sdl },
+                ),
+            ))
+        })
+        .boxed();
+        let (mut composition_messages, composition_subtask) = Subtask::new(composition_handler);
+        let cancellation_token = CancellationToken::new();
+        composition_subtask.run(subgraph_change_events, Some(cancellation_token.clone()));
+
+        // Assert we always get a subgraph added event.
+        let next_message = composition_messages.next().await;
+        assert_that!(next_message).is_some().matches(|event| {
+            matches!(
+                event,
+                CompositionEvent::SubgraphAdded(CompositionSubgraphAdded { .. })
+            )
+        });
+
+        // Assert we always get a composition started event.
+        let next_message = composition_messages.next().await;
+        assert_that!(next_message)
+            .is_some()
+            .matches(|event| matches!(event, CompositionEvent::Started));
+
+        // Assert we get the expected final composition event.
+        if !composition_error {
+            let next_message = composition_messages.next().await;
+            assert_that!(next_message).is_some().matches(|event| {
+                if let CompositionEvent::Success(success) = event {
+                    success
+                        == &default_composition_success(FederationVersion::ExactFedTwo(
+                            Version::from_str("2.8.0").unwrap(),
+                        ))
+                } else {
+                    false
+                }
+            });
+        } else {
+            assert!(matches!(
+                composition_messages.next().await.unwrap(),
+                CompositionEvent::Error(..)
+            ));
+        }
+
+        cancellation_token.cancel();
+        Ok(())
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_runcomposition_subgraph_batch_runs_one_composition() -> Result<()> {
+        use crate::composition::watchers::composition::CompositionInputEvent::SubgraphBatch;
+
+        let temp_dir = assert_fs::TempDir::new()?;
+        let temp_dir_path = Utf8PathBuf::from_path_buf(temp_dir.to_path_buf()).unwrap();
+
+        let federation_version = Version::from_str("2.8.0").unwrap();
+        let subgraphs = FullyResolvedSupergraphConfig::builder()
+            .subgraphs(BTreeMap::new())
+            .federation_version(FederationVersion::ExactFedTwo(federation_version.clone()))
+            .build();
+        let supergraph_version = SupergraphVersion::new(federation_version.clone());
+        let supergraph_binary = SupergraphBinary::builder()
+            .version(supergraph_version)
+            .exe(Utf8PathBuf::from_str("some/binary").unwrap())
+            .provenance(test_provenance())
+            .build();
+
+        let composition_output = serde_json::to_string(&default_composition_json()).unwrap();
+        let mut mock_exec = MockExecCommand::new();
+        mock_exec
+            .expect_exec_command()
+            .times(1)
+            .returning(move |_| {
+                Ok(Output {
+                    status: ExitStatus::default(),
+                    stdout: composition_output.as_bytes().into(),
+                    stderr: Vec::default(),
+                })
+            });
+
+        let mut mock_write_file = MockWriteFile::new();
+        mock_write_file
+            .expect_write_file()
+            .times(1)
+            .returning(|_, _| Ok(()));
+
+        let composition_handler = CompositionWatcher::builder()
+            .initial_supergraph_config(subgraphs)
+            .supergraph_binary(Ok(supergraph_binary))
+            .exec_command(mock_exec)
+            .write_file(mock_write_file)
+            .temp_dir(temp_dir_path)
+            .compose_on_initialisation(false)
+            .build();
+
+        let subgraph_sdl = "type Query { test: String! }".to_string();
+        let inner: Vec<SubgraphEvent> = (0..3)
+            .map(|i| {
+                SubgraphEvent::SubgraphSchemaChanged(SubgraphSchemaChanged::new(
+                    format!("subgraph-{i}"),
+                    subgraph_sdl.clone(),
+                    "https://example.com".to_string(),
+                    SchemaSource::Sdl {
+                        sdl: subgraph_sdl.clone(),
+                    },
+                ))
+            })
+            .collect();
+        let event_stream: BoxStream<CompositionInputEvent> =
+            once(async { SubgraphBatch(inner) }).boxed();
+
+        let (mut composition_messages, composition_subtask) = Subtask::new(composition_handler);
+        let cancellation_token = CancellationToken::new();
+        composition_subtask.run(event_stream, Some(cancellation_token.clone()));
+
+        let mut subgraph_added = 0;
+        let mut started = 0;
+        let mut success = 0;
+        let mut error = 0;
+        while let Some(ev) = composition_messages.next().await {
+            match ev {
+                CompositionEvent::SubgraphAdded(_) => subgraph_added += 1,
+                CompositionEvent::Started => started += 1,
+                CompositionEvent::Success(_) => success += 1,
+                CompositionEvent::Error(_) => error += 1,
+                _ => {}
+            }
+        }
+
+        assert_that!(subgraph_added).is_equal_to(3);
+        assert_that!(started).is_equal_to(1);
+        assert_that!(success).is_equal_to(1);
+        assert_that!(error).is_equal_to(0);
+
+        cancellation_token.cancel();
+        Ok(())
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn test_runcomposition_rejects_federation_one_change() -> Result<()> {
+        use crate::composition::watchers::composition::CompositionInputEvent::Federation;
+
+        let temp_dir = assert_fs::TempDir::new()?;
+        let temp_dir_path = Utf8PathBuf::from_path_buf(temp_dir.to_path_buf()).unwrap();
+
+        let federation_version = Version::from_str("2.8.0").unwrap();
+        let subgraphs = FullyResolvedSupergraphConfig::builder()
+            .subgraphs(BTreeMap::new())
+            .federation_version(FederationVersion::ExactFedTwo(federation_version.clone()))
+            .build();
+        let supergraph_version = SupergraphVersion::new(federation_version.clone());
+        let supergraph_binary = SupergraphBinary::builder()
+            .version(supergraph_version)
+            .exe(Utf8PathBuf::from_str("some/binary").unwrap())
+            .provenance(test_provenance())
+            .build();
+
+        // `reject_federation_one` must short-circuit before any of this is reached.
+        let mut mock_exec = MockExecCommand::new();
+        mock_exec.expect_exec_command().times(0);
+
+        let mut mock_write_file = MockWriteFile::new();
+        mock_write_file.expect_write_file().times(0);
+
+        let studio_client_config = StudioClientConfig::new(
+            None,
+            Config {
+                home: Utf8PathBuf::from_path_buf(assert_fs::TempDir::new()?.to_path_buf()).unwrap(),
+                override_api_key: None,
+                override_client_credentials_token: None,
+            },
+            false,
+            ClientBuilder::default(),
+            ClientTimeout::default(),
+        );
+        let federation_updater_config = FederationUpdaterConfig {
+            studio_client_config,
+            elv2_licence_accepter: LicenseAccepter {
+                elv2_license_accepted: Some(true),
+            },
+            skip_update: false,
+            override_install_path: None,
+        };
+
+        let composition_handler = CompositionWatcher::builder()
+            .initial_supergraph_config(subgraphs)
+            .supergraph_binary(Ok(supergraph_binary))
+            .exec_command(mock_exec)
+            .write_file(mock_write_file)
+            .temp_dir(temp_dir_path)
+            .compose_on_initialisation(false)
+            .federation_updater_config(federation_updater_config)
+            .build();
+
+        let federation_version_change_event: BoxStream<CompositionInputEvent> =
+            once(async { Federation(FederationVersion::LatestFedOne) }).boxed();
+        let (mut composition_messages, composition_subtask) = Subtask::new(composition_handler);
+        let cancellation_token = CancellationToken::new();
+        composition_subtask.run(
+            federation_version_change_event,
+            Some(cancellation_token.clone()),
+        );
+
+        let next_message = composition_messages.next().await;
+        assert_that!(next_message).is_some().matches(|event| {
+            matches!(
+                event,
+                CompositionEvent::Error(CompositionError::FederationOneUnsupported(_))
+            )
+        });
+
+        cancellation_token.cancel();
+        Ok(())
+    }
+}

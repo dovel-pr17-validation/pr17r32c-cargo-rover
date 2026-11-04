@@ -1,0 +1,616 @@
+use std::env;
+
+pub use code::RoverErrorCode;
+use houston::HoustonProblem;
+use rover_client::{EndpointKind, RoverClientError};
+use serde::Serialize;
+pub use suggestion::RoverErrorSuggestion;
+
+use crate::{
+    options::{JsonVersion, ProjectSettingsError, SettingValueError},
+    plugin,
+    utils::env::RoverEnvKey,
+};
+
+mod code;
+mod suggestion;
+
+/// Metadata contains extra information about specific errors
+/// Currently this includes an optional error `Code`
+/// and an optional `Suggestion`
+#[derive(Default, Serialize, Debug)]
+pub struct RoverErrorMetadata {
+    // skip serializing for now until we can appropriately strip color codes
+    #[serde(skip_serializing)]
+    pub suggestions: Vec<RoverErrorSuggestion>,
+    pub code: Option<RoverErrorCode>,
+
+    // anyhow's debug implementation prints the error cause, most of the time we want this
+    // but sometimes the cause is already included in the error's Display impl (like reqwest::Error)
+    #[serde(skip_serializing)]
+    pub skip_printing_cause: bool,
+
+    #[serde(skip_serializing)]
+    pub(crate) json_version: JsonVersion,
+}
+
+/// `Metadata` structs can be created from an `anyhow::Error`
+/// This works by downcasting the errors to their underlying types
+/// and creating `Suggestion`s and `Code`s where applicable
+impl From<&mut anyhow::Error> for RoverErrorMetadata {
+    fn from(error: &mut anyhow::Error) -> Self {
+        // A plugin failure is the most specific explanation an error can have,
+        // so it decides the code even when a caller has wrapped it.
+        if let Some(plugin_failure) = plugin::error::find_in_chain(error) {
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: vec![RoverErrorSuggestion::Plugin(plugin_failure.next_step())],
+                code: Some(plugin_failure.code()),
+                skip_printing_cause: false,
+            };
+        }
+
+        if crate::federation::is_federation_one_unsupported(error) {
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: vec![],
+                code: Some(RoverErrorCode::E064),
+                skip_printing_cause: false,
+            };
+        }
+
+        if let Some(revoke_error) =
+            error.downcast_ref::<crate::command::auth::grants::revoke::error::GrantsRevokeError>()
+        {
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: vec![],
+                code: revoke_error.code(),
+                skip_printing_cause: false,
+            };
+        }
+
+        let mut skip_printing_cause = false;
+        if let Some(rover_client_error) = error.downcast_ref::<RoverClientError>() {
+            let (suggestion, code) = match rover_client_error {
+                &RoverClientError::InvalidJson(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E001),
+                ),
+                &RoverClientError::GraphProjectInitError => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E001),
+                ),
+                RoverClientError::InvalidHeaderName(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E002),
+                ),
+                RoverClientError::InvalidHeaderValue(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E003),
+                ),
+                RoverClientError::SendRequest {
+                    source,
+                    endpoint_kind,
+                } => {
+                    // reqwest::Error's Display impl already includes the cause, so we can skip printing it
+                    skip_printing_cause = true;
+
+                    if source.is_connect() {
+                        let code = Some(RoverErrorCode::E028);
+                        if matches!(
+                            endpoint_kind,
+                            EndpointKind::ApolloStudio | EndpointKind::Orbiter
+                        ) {
+                            (Some(RoverErrorSuggestion::SubmitIssue), code)
+                        } else {
+                            (Some(RoverErrorSuggestion::CheckServerConnection), code)
+                        }
+                    } else if source.is_timeout() {
+                        (
+                            Some(RoverErrorSuggestion::IncreaseClientTimeout),
+                            Some(RoverErrorCode::E031),
+                        )
+                    } else if source.is_decode() {
+                        if matches!(
+                            endpoint_kind,
+                            EndpointKind::ApolloStudio | EndpointKind::Orbiter
+                        ) {
+                            (
+                                Some(RoverErrorSuggestion::SubmitIssue),
+                                Some(RoverErrorCode::E004),
+                            )
+                        } else {
+                            (
+                                Some(RoverErrorSuggestion::CheckResponseType),
+                                Some(RoverErrorCode::E004),
+                            )
+                        }
+                    } else if source.is_status() {
+                        if matches!(
+                            endpoint_kind,
+                            EndpointKind::ApolloStudio | EndpointKind::Orbiter
+                        ) {
+                            (
+                                Some(RoverErrorSuggestion::SubmitIssue),
+                                Some(RoverErrorCode::E004),
+                            )
+                        } else {
+                            (
+                                Some(RoverErrorSuggestion::CheckServerConnection),
+                                Some(RoverErrorCode::E004),
+                            )
+                        }
+                    } else if matches!(
+                        endpoint_kind,
+                        EndpointKind::ApolloStudio | EndpointKind::Orbiter
+                    ) {
+                        (
+                            Some(RoverErrorSuggestion::SubmitIssue),
+                            Some(RoverErrorCode::E004),
+                        )
+                    } else {
+                        (None, Some(RoverErrorCode::E004))
+                    }
+                }
+                RoverClientError::MalformedResponse { null_field: _ }
+                | RoverClientError::LaunchNotFound { .. } => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E005),
+                ),
+                RoverClientError::InvalidSeverity => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E006),
+                ),
+                RoverClientError::SubgraphBuildErrors {
+                    graph_ref,
+                    subgraph,
+                    source: _,
+                } => (
+                    Some(RoverErrorSuggestion::FixSubgraphSchema {
+                        graph_ref: graph_ref.clone(),
+                        subgraph: subgraph.clone(),
+                    }),
+                    Some(RoverErrorCode::E029),
+                ),
+                RoverClientError::BuildErrors {
+                    source,
+                    num_subgraphs,
+                } => {
+                    if source.is_config {
+                        (
+                            Some(RoverErrorSuggestion::FixSupergraphConfigErrors),
+                            Some(RoverErrorCode::E038),
+                        )
+                    } else {
+                        (
+                            Some(RoverErrorSuggestion::FixCompositionErrors {
+                                num_subgraphs: *num_subgraphs,
+                            }),
+                            Some(RoverErrorCode::E029),
+                        )
+                    }
+                }
+                RoverClientError::ContractPublishErrors {
+                    msgs: _,
+                    no_launch: _,
+                } => (
+                    Some(RoverErrorSuggestion::FixContractPublishErrors),
+                    Some(RoverErrorCode::E040),
+                ),
+                RoverClientError::CheckWorkflowFailure {
+                    graph_ref: _,
+                    check_response: _,
+                }
+                | RoverClientError::PublishCheckFailure {
+                    graph_ref: _,
+                    check_response: _,
+                } => (
+                    Some(RoverErrorSuggestion::FixCheckFailures),
+                    Some(RoverErrorCode::E043),
+                ),
+                RoverClientError::PublishLaunchFailure {
+                    graph_ref: _,
+                    publish_response: _,
+                } => (None, Some(RoverErrorCode::E047)),
+                RoverClientError::LintFailures { lint_response: _ } => (
+                    Some(RoverErrorSuggestion::FixLintFailure),
+                    Some(RoverErrorCode::E042),
+                ),
+                RoverClientError::SubgraphIntrospectionNotAvailable => (
+                    Some(RoverErrorSuggestion::UseFederatedGraph),
+                    Some(RoverErrorCode::E007),
+                ),
+                RoverClientError::ExpectedFederatedGraph {
+                    graph_ref: _,
+                    can_operation_convert,
+                } => {
+                    if *can_operation_convert {
+                        (
+                            Some(RoverErrorSuggestion::ConvertGraphToSubgraph),
+                            Some(RoverErrorCode::E007),
+                        )
+                    } else {
+                        (
+                            Some(RoverErrorSuggestion::UseFederatedGraph),
+                            Some(RoverErrorCode::E007),
+                        )
+                    }
+                }
+                RoverClientError::ExpectedContractVariant { graph_ref: _ } => (
+                    Some(RoverErrorSuggestion::UseContractVariant),
+                    Some(RoverErrorCode::E039),
+                ),
+                RoverClientError::NoSchemaForVariant {
+                    graph_ref,
+                    valid_variants,
+                    frontend_url_root,
+                } => (
+                    Some(RoverErrorSuggestion::ProvideValidVariant {
+                        graph_ref: graph_ref.clone(),
+                        valid_variants: valid_variants.clone(),
+                        frontend_url_root: frontend_url_root.clone(),
+                    }),
+                    Some(RoverErrorCode::E008),
+                ),
+                RoverClientError::NoSubgraphInGraph {
+                    invalid_subgraph: _,
+                    valid_subgraphs,
+                } => (
+                    Some(RoverErrorSuggestion::ProvideValidSubgraph(
+                        valid_subgraphs.clone(),
+                    )),
+                    Some(RoverErrorCode::E009),
+                ),
+                RoverClientError::GraphNotFound { .. }
+                | RoverClientError::GraphIdNotFound { .. } => (
+                    Some(RoverErrorSuggestion::CheckGraphNameAndAuth),
+                    Some(RoverErrorCode::E010),
+                ),
+                RoverClientError::GraphQl { .. } => (None, None),
+                RoverClientError::IntrospectionError { .. } => (None, Some(RoverErrorCode::E011)),
+                RoverClientError::ClientError { .. } => (None, Some(RoverErrorCode::E012)),
+                RoverClientError::InvalidKey => {
+                    let suggestion_key = match std::env::var(RoverEnvKey::Key.to_string()) {
+                        Ok(_) => RoverErrorSuggestion::TryUnsetKey,
+                        Err(_) => RoverErrorSuggestion::CheckKey,
+                    };
+
+                    (Some(suggestion_key), Some(RoverErrorCode::E013))
+                }
+                RoverClientError::MalformedKey => (
+                    Some(RoverErrorSuggestion::ProperKey),
+                    Some(RoverErrorCode::E014),
+                ),
+                RoverClientError::UnparseableReleaseVersion { source: _ } => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E015),
+                ),
+                RoverClientError::BadReleaseUrl => (Some(RoverErrorSuggestion::SubmitIssue), None),
+                RoverClientError::NoSupergraphBuilds { .. } => (
+                    Some(RoverErrorSuggestion::RunComposition),
+                    Some(RoverErrorCode::E027),
+                ),
+                RoverClientError::AdhocError { .. } => (None, None),
+                RoverClientError::InvalidGraphRef(_) => (
+                    Some(RoverErrorSuggestion::CheckGraphNameAndAuth),
+                    Some(RoverErrorCode::E010),
+                ),
+                RoverClientError::InvalidValidationPeriodDuration(_)
+                | RoverClientError::ValidationPeriodTooGranular => {
+                    unreachable!("Validation period parse errors should be caught via clap")
+                }
+                RoverClientError::InvalidInputError { graph_ref } => (
+                    Some(RoverErrorSuggestion::FixChecksInput {
+                        graph_ref: graph_ref.clone(),
+                    }),
+                    Some(RoverErrorCode::E032),
+                ),
+                RoverClientError::PermissionError { .. } => (
+                    Some(RoverErrorSuggestion::CheckGraphNameAndAuth),
+                    Some(RoverErrorCode::E033),
+                ),
+                RoverClientError::PlanError { .. } => (
+                    Some(RoverErrorSuggestion::UpgradePlan),
+                    Some(RoverErrorCode::E034),
+                ),
+                RoverClientError::RateLimitExceeded => {
+                    (Some(RoverErrorSuggestion::TryAgainLater), None)
+                }
+                RoverClientError::ChecksTimeoutError { url } => (
+                    Some(RoverErrorSuggestion::IncreaseChecksTimeout { url: url.clone() }),
+                    None,
+                ),
+                RoverClientError::CheckWorkflowResultUnavailable { url, .. } => (
+                    Some(RoverErrorSuggestion::ViewCheckResultInStudio { url: url.clone() }),
+                    None,
+                ),
+                RoverClientError::PreviewTimeoutError { .. }
+                | RoverClientError::PreviewResultUnavailable { .. } => (None, None),
+                RoverClientError::LaunchTimeoutError { url }
+                | RoverClientError::PublishLaunchTimeout { url, .. } => (
+                    Some(RoverErrorSuggestion::IncreaseChecksTimeout { url: url.clone() }),
+                    Some(RoverErrorCode::E065),
+                ),
+                RoverClientError::RequestTooLarge { .. } => (
+                    Some(RoverErrorSuggestion::Adhoc(
+                        "For schema checks and publishes, this usually means the schema exceeds the maximum size GraphOS accepts. Try reducing the schema's size, and if you believe this is in error, contact Apollo support.".to_string(),
+                    )),
+                    None,
+                ),
+                RoverClientError::UnknownCheckWorkflowStatus => {
+                    (Some(RoverErrorSuggestion::SubmitIssue), None)
+                }
+                RoverClientError::MissingRoutingUrlError {
+                    subgraph_name,
+                    graph_ref,
+                } => (
+                    Some(RoverErrorSuggestion::ProvideRoutingUrl {
+                        subgraph_name: subgraph_name.clone(),
+                        graph_ref: graph_ref.clone(),
+                    }),
+                    Some(RoverErrorCode::E041),
+                ),
+                RoverClientError::NoPersistedQueryList {
+                    graph_ref,
+                    frontend_url_root,
+                } => (
+                    Some(RoverErrorSuggestion::LinkPersistedQueryList {
+                        graph_ref: graph_ref.clone(),
+                        frontend_url_root: frontend_url_root.clone(),
+                    }),
+                    None,
+                ),
+                RoverClientError::PersistedQueryListIdNotFound {
+                    graph_id,
+                    list_id: _,
+                    frontend_url_root,
+                } => (
+                    Some(RoverErrorSuggestion::CreateOrFindValidPersistedQueryList {
+                        graph_id: graph_id.clone(),
+                        frontend_url_root: frontend_url_root.clone(),
+                    }),
+                    None,
+                ),
+                RoverClientError::RelayOperationParseFailures { .. } => (None, None),
+                RoverClientError::OfflineLicenseNotEnabled => (
+                    Some(RoverErrorSuggestion::ContactApolloAccountManager),
+                    Some(RoverErrorCode::E044),
+                ),
+                RoverClientError::OrganizationNotFound { .. } => {
+                    (Some(RoverErrorSuggestion::CheckGraphNameAndAuth), None)
+                }
+                RoverClientError::OrganizationIDNotFound { .. } => {
+                    (Some(RoverErrorSuggestion::CheckGraphNameAndAuth), None)
+                }
+                // FR73: one permission-denied code across the spec, whichever action was refused.
+                // Each message already names the exact requirement - no generic suggestion adds
+                // anything here.
+                RoverClientError::PairPermissionDenied { .. }
+                | RoverClientError::GrantPermissionDenied { .. } => {
+                    (None, Some(RoverErrorCode::E053))
+                }
+                // The message already names the organization; `data.keys` (rendered by
+                // `RoverError::print()`/`get_internal_data_json()`, not this metadata) carries
+                // the best-effort recovery.
+                RoverClientError::PairListFailure { .. } => (None, Some(RoverErrorCode::E056)),
+                // The message already names the ID and organization, and that it's rotate-only -
+                // no generic suggestion adds anything here either.
+                RoverClientError::PairNotFound { .. } => (None, Some(RoverErrorCode::E057)),
+                // A usage-adjacent failure (FR23 leaves the actual bound to the Platform API,
+                // but a value this large overflows `chrono` itself before any request is made)
+                // - not spec-required to have its own stable code, and the message is already
+                // self-explanatory.
+                RoverClientError::GracePeriodTooLarge { .. } => (None, None),
+                // The message says why; the suggestion gives the only workaround there is.
+                RoverClientError::PairCannotBeRenamed { .. } => (
+                    Some(RoverErrorSuggestion::Adhoc(
+                        "To give a pair a different name, create a new pair with `rover api-key \
+                        create <ORGANIZATION_ID> client-credentials <NAME>` and delete this one."
+                            .to_string(),
+                    )),
+                    Some(RoverErrorCode::E059),
+                ),
+                RoverClientError::ServiceReady(_) => (None, None),
+                RoverClientError::Service { .. } => (None, None),
+                RoverClientError::InvalidTimestamp(_) => (None, None),
+                RoverClientError::ApiKeyNotFound { .. } => (None, None),
+                RoverClientError::GraphCreationError { .. } => (None, None),
+                RoverClientError::GraphArtifactOperationInProgress { .. } => {
+                    (Some(RoverErrorSuggestion::TryAgainLater), None)
+                }
+                RoverClientError::GraphArtifactBuildFailed {
+                    graph_id,
+                    launch_id,
+                    ..
+                } => (
+                    Some(RoverErrorSuggestion::RetryLaunch {
+                        graph_id: graph_id.clone(),
+                        launch_id: launch_id.clone(),
+                    }),
+                    None,
+                ),
+                RoverClientError::GraphArtifactNotFound { .. }
+                | RoverClientError::GraphArtifactDigestInvalid { .. }
+                | RoverClientError::GraphArtifactTagInvalid { .. }
+                | RoverClientError::GraphArtifactTagVariantAssign { .. }
+                | RoverClientError::GraphArtifactTaggingLimit { .. }
+                | RoverClientError::GraphArtifactTotalTagsLimit { .. } => (None, None),
+                RoverClientError::MaxRetriesExceeded { .. } => (
+                    Some(RoverErrorSuggestion::ContactApolloSupport),
+                    Some(RoverErrorCode::E045),
+                ),
+            };
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: suggestion.into_iter().collect(),
+                code,
+                skip_printing_cause,
+            };
+        }
+
+        if let Some(houston_problem) = error.downcast_ref::<HoustonProblem>() {
+            let (suggestion, code) = match houston_problem {
+                HoustonProblem::CouldNotCreateConfigHome(_) => (
+                    Some(RoverErrorSuggestion::SetConfigHome),
+                    Some(RoverErrorCode::E016),
+                ),
+                HoustonProblem::DefaultConfigDirNotFound => (
+                    Some(RoverErrorSuggestion::SetConfigHome),
+                    Some(RoverErrorCode::E017),
+                ),
+                HoustonProblem::InvalidOverrideConfigDir(_) => (
+                    Some(RoverErrorSuggestion::SetConfigHome),
+                    Some(RoverErrorCode::E018),
+                ),
+                HoustonProblem::NoConfigFound(_) => {
+                    let code = Some(RoverErrorCode::E019);
+                    let suggestion = if env::var_os(RoverEnvKey::ConfigHome.to_string()).is_some() {
+                        Some(RoverErrorSuggestion::MigrateConfigHomeOrCreateConfig)
+                    } else {
+                        Some(RoverErrorSuggestion::CreateConfig)
+                    };
+                    (suggestion, code)
+                }
+                HoustonProblem::NoConfigProfiles => (
+                    Some(RoverErrorSuggestion::NewUserNoProfiles),
+                    Some(RoverErrorCode::E020),
+                ),
+                HoustonProblem::ProfileNotFound(_) => (
+                    Some(RoverErrorSuggestion::ListProfiles),
+                    Some(RoverErrorCode::E021),
+                ),
+                HoustonProblem::NoNonSensitiveConfigFound(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E022),
+                ),
+                HoustonProblem::NoCredential(_) => (None, Some(RoverErrorCode::E055)),
+                HoustonProblem::CorruptedProfile(profile_name) => (
+                    Some(RoverErrorSuggestion::RecreateConfig(
+                        profile_name.to_string(),
+                    )),
+                    Some(RoverErrorCode::E035),
+                ),
+                HoustonProblem::PathNotUtf8(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E023),
+                ),
+                HoustonProblem::TomlDeserialization(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E024),
+                ),
+                HoustonProblem::TomlSerialization(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E025),
+                ),
+                HoustonProblem::IoError(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E026),
+                ),
+                HoustonProblem::AdhocError(_) => (None, None),
+                HoustonProblem::RoverStdError(_) => (None, None),
+                HoustonProblem::SecretStoreError(_) => (
+                    Some(RoverErrorSuggestion::SubmitIssue),
+                    Some(RoverErrorCode::E046),
+                ),
+            };
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: suggestion.into_iter().collect(),
+                code,
+                skip_printing_cause,
+            };
+        }
+
+        // FR86: a stored setting's value failing its type's syntactic check
+        // gets its own stable code - the message itself (from
+        // `SettingValueError`'s `Display`, or the fuller wrapping in
+        // `Rover::validate_profile_value` or `validate_project_value`) already
+        // names a concrete way to correct it, so no separate suggestion is
+        // added here. `skip_printing_cause: true` because both preserve
+        // `SettingValueError` via `anyhow::Error::context`, whose
+        // own `Display` is already folded into that context message - without
+        // this, the read path would print the same reason twice (once in the
+        // context message, once again as `anyhow`'s "Caused by:" tail).
+        if error.downcast_ref::<SettingValueError>().is_some() {
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: vec![],
+                code: Some(RoverErrorCode::E054),
+                skip_printing_cause: true,
+            };
+        }
+
+        // FR86: a credential in the project file and a setting spelled both
+        // ways there each get their own stable code. Both messages already say
+        // exactly what to remove, so no suggestion is added.
+        if let Some(project_settings_error) = error.downcast_ref::<ProjectSettingsError>() {
+            let code = match project_settings_error {
+                ProjectSettingsError::Credential { .. } => RoverErrorCode::E060,
+                ProjectSettingsError::SpelledBothWays { .. } => RoverErrorCode::E061,
+            };
+            return RoverErrorMetadata {
+                json_version: JsonVersion::default(),
+                suggestions: vec![],
+                code: Some(code),
+                skip_printing_cause,
+            };
+        }
+
+        #[cfg(feature = "composition-js")]
+        {
+            use crate::composition::CompositionError;
+            if let Some(composition_error) = error.downcast_ref::<CompositionError>() {
+                let (suggestion, code) = match composition_error {
+                    CompositionError::Build { source, .. } => (
+                        Some(RoverErrorSuggestion::FixCompositionErrors {
+                            num_subgraphs: source.len(),
+                        }),
+                        Some(RoverErrorCode::E029),
+                    ),
+                    _ => (None, None),
+                };
+                return RoverErrorMetadata {
+                    json_version: JsonVersion::default(),
+                    suggestions: suggestion.into_iter().collect(),
+                    code,
+                    skip_printing_cause,
+                };
+            }
+        }
+
+        RoverErrorMetadata::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rover_client::RoverClientError;
+    use speculoos::prelude::*;
+
+    use crate::{RoverError, RoverErrorCode};
+
+    #[test]
+    fn a_launch_that_outlasts_the_wait_has_its_own_code_and_message() {
+        let error = RoverError::new(RoverClientError::LaunchTimeoutError { url: None });
+
+        assert_that!(error.code()).is_equal_to(Some(RoverErrorCode::E065));
+        assert_that!(error.message())
+            .is_equal_to("Timed out waiting for the launch to complete.".to_string());
+    }
+
+    /// The publish commands' timeout carries the publish response, but is the same E065.
+    #[test]
+    fn a_publish_that_outlasts_the_launch_wait_is_e065_and_keeps_its_response() {
+        let publish_response = serde_json::json!({ "api_schema_hash": "123456" });
+        let error = RoverError::new(RoverClientError::PublishLaunchTimeout {
+            url: None,
+            publish_response: publish_response.clone(),
+        });
+
+        assert_that!(error.code()).is_equal_to(Some(RoverErrorCode::E065));
+        assert_that!(error.message())
+            .is_equal_to("Timed out waiting for the launch to complete.".to_string());
+        assert_that!(error.get_internal_data_json()).is_equal_to(publish_response);
+    }
+}

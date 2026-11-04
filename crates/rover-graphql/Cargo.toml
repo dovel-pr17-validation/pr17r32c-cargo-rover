@@ -1,0 +1,32 @@
+[package]
+name = "rover-graphql"
+version = "0.0.0"
+edition = "2021"
+
+publish = false
+
+[dependencies]
+bytes = { workspace = true }
+graphql_client = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+rover-http = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tower = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+rover-http = { workspace = true, features = ["test"] }
+rover-tower = { workspace = true, features = ["test"] }
+rstest = { workspace = true }
+speculoos = { workspace = true }
+tower-test = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

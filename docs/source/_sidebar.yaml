@@ -1,0 +1,73 @@
+items:
+  - label: Overview
+    href: ./
+  - label: Upgrading to Rover 1.0
+    href: ./upgrading-to-1
+  - label: Install
+    href: ./getting-started
+  - label: Configure
+    href: ./configuring
+  - label: Proxy Configuration
+    href: ./proxy
+  - label: CI/CD
+    href: ./ci-cd
+  - label: Conventions
+    href: ./conventions
+  - label: Privacy and Data Collection
+    href: ./privacy
+  - label: Contributing
+    href: ./contributing
+  - label: Error Codes
+    href: ./errors
+  - label: Commands
+    children:
+      - label: api-key
+        href: ./commands/api-key
+      - label: auth
+        href: ./commands/auth
+      - label: client
+        href: ./commands/client
+      - label: completion
+        href: ./commands/completion
+      - label: config
+        href: ./commands/config
+      - label: connector
+        href: ./commands/connectors
+      - label: contract
+        href: ./commands/contracts
+      - label: dev
+        href: ./commands/dev
+      - label: explain
+        href: ./commands/explain
+      - label: install
+        href: ./commands/install
+      - label: graph
+        href: ./commands/graphs
+      - label: graph-artifact
+        href: ./commands/graph-artifact
+      - label: init
+        href: ./commands/init
+      - label: license
+        href: ./commands/license
+      - label: persisted-queries
+        href: ./commands/persisted-queries
+      - label: plugin
+        href: ./commands/plugin
+      - label: readme
+        href: ./commands/readmes
+      - label: schema
+        href: ./commands/schema
+      - label: subgraph
+        href: ./commands/subgraphs
+      - label: supergraph
+        href: ./commands/supergraphs
+      - label: template
+        href: ./commands/template
+  - label: The Apollo CLI (deprecated)
+    children:
+      - label: Installation
+        href: ./apollo-cli
+      - label: Validating Client Operations
+        href: ./validating-client-operations
+      - label: Moving to Rover
+        href: ./migration

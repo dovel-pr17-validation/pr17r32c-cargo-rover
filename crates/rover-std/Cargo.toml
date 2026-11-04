@@ -1,0 +1,34 @@
+[package]
+name = "rover-std"
+version = "0.1.0"
+authors = ["Apollo Developers <opensource@apollographql.com>"]
+edition = "2021"
+
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+bon = { workspace = true }
+camino = { workspace = true }
+dunce = { workspace = true }
+encoding_rs = { workspace = true }
+globwalk = { workspace = true }
+console = { workspace = true }
+notify = { workspace = true }
+tap = { workspace = true }
+tokio = { workspace = true, features = [ "macros", "rt", "rt-multi-thread", "time" ] }
+tokio-util = { workspace = true}
+thiserror = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+termimad = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+notify = { workspace = true }
+rstest = { workspace = true }
+speculoos = { workspace = true }
+
+[lints]
+workspace = true

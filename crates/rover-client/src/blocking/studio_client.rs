@@ -1,0 +1,602 @@
+use std::{str::FromStr, time::Duration};
+
+use graphql_client::GraphQLQuery;
+use houston::{Credential, CredentialOrigin};
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as ReqwestClient,
+};
+use rover_graphql::{GraphQLLayer, GraphQLService};
+use rover_http::{
+    retry::{retry_with_attempt_timeout, RetryPolicy},
+    timeout::TimeoutLayer,
+    HttpService, ReqwestService,
+};
+use rover_studio::service::{
+    permission_denied::PermissionDeniedLayer, rejected_credential::RejectedCredentialLayer,
+    HttpStudioServiceError, HttpStudioServiceLayer,
+};
+use tower::{retry::RetryLayer, util::BoxCloneServiceLayer, ServiceBuilder, ServiceExt};
+use url::Url;
+
+use crate::{
+    blocking::{GraphQLClient, CLIENT_NAME},
+    error::EndpointKind,
+    RoverClientError,
+};
+
+#[derive(thiserror::Error, Debug)]
+pub enum InitStudioServiceError {
+    #[error(transparent)]
+    Url(#[from] url::ParseError),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    StudioService(#[from] HttpStudioServiceError),
+}
+
+impl From<InitStudioServiceError> for RoverClientError {
+    fn from(value: InitStudioServiceError) -> Self {
+        RoverClientError::ServiceReady(Box::new(value))
+    }
+}
+
+/// Represents a client for making GraphQL requests to Apollo Studio.
+pub struct StudioClient {
+    pub credential: Credential,
+    graphql_endpoint: String,
+    client: GraphQLClient,
+    reqwest_client: ReqwestClient,
+    version: String,
+    is_sudo: bool,
+    retry_period: Duration,
+}
+
+impl StudioClient {
+    /// Construct a new [StudioClient] from an `api_key`, a `uri`, and a `version`.
+    /// For use in Rover, the `uri` is usually going to be to Apollo Studio
+    pub fn new(
+        credential: Credential,
+        graphql_endpoint: &str,
+        version: &str,
+        is_sudo: bool,
+        client: ReqwestClient,
+        retry_period: Duration,
+    ) -> StudioClient {
+        StudioClient {
+            credential,
+            graphql_endpoint: graphql_endpoint.to_string(),
+            reqwest_client: client.clone(),
+            client: GraphQLClient::new(graphql_endpoint, client, retry_period),
+            version: version.to_string(),
+            is_sudo,
+            retry_period,
+        }
+    }
+
+    /// Client method for making a GraphQL request to Apollo Studio.
+    ///
+    /// Takes one argument, `variables`. Returns a Response or a RoverClientError.
+    /// Automatically retries requests.
+    pub async fn post<Q: GraphQLQuery>(
+        &self,
+        variables: Q::Variables,
+    ) -> Result<Q::ResponseData, RoverClientError> {
+        let mut header_map = self.build_studio_headers()?;
+        self.client
+            .post::<Q>(variables, &mut header_map, EndpointKind::ApolloStudio)
+            .await
+            .map_err(|err| self.refine_rejected_credential_error(err))
+    }
+
+    /// Client method for making a GraphQL request to Apollo Studio.
+    ///
+    /// Takes one argument, `variables`. Returns a Response or a RoverClientError.
+    /// Does not automatically retry requests.
+    pub async fn post_no_retry<Q: GraphQLQuery>(
+        &self,
+        variables: Q::Variables,
+    ) -> Result<Q::ResponseData, RoverClientError> {
+        let mut header_map = self.build_studio_headers()?;
+        self.client
+            .post_no_retry::<Q>(variables, &mut header_map, EndpointKind::ApolloStudio)
+            .await
+            .map_err(|err| self.refine_rejected_credential_error(err))
+    }
+
+    /// Upgrades a registry rejection to [`RoverClientError::MalformedKey`] when the key we
+    /// sent couldn't have been accepted in the first place.
+    ///
+    /// Runs only _after_ a rejection rather than pre-flight, so Rover never refuses to send a
+    /// key that Studio would have accepted.
+    ///
+    /// Used by [`StudioClient::post`]/[`StudioClient::post_no_retry`] above. Operations built
+    /// directly on the Tower `studio_graphql_service` stack have no `Credential` in their
+    /// `service.rs` to refine with — `RejectedCredentialLayer` classifies a *status-code*
+    /// rejection using the credential it already holds, but a *body-level* rejection
+    /// (`GraphQLServiceError::InvalidCredentials`, parsed by `rover-graphql`, which knows nothing
+    /// about credentials) can only ever produce the weaker [`RoverClientError::InvalidKey`] —
+    /// refining it against the credential's actual shape has to happen back here, in each
+    /// `runner.rs` that has both the error and a `StudioClient` in hand. Not every such operation
+    /// needs this: some (e.g. `graph::validate_operations`, `subgraph::fetch_all`) remap
+    /// `InvalidCredentials` to a different error in their own `service.rs` before it would ever
+    /// reach `InvalidKey`.
+    pub(crate) fn refine_rejected_credential_error(
+        &self,
+        err: RoverClientError,
+    ) -> RoverClientError {
+        match err {
+            RoverClientError::InvalidKey if self.credential.has_malformed_api_key() => {
+                RoverClientError::MalformedKey
+            }
+            err => err,
+        }
+    }
+
+    /// Function for building a [HeaderMap] for making http requests. Use for making
+    /// requests to Apollo Studio. We're leaving this separate from `build` since we
+    /// need to be able to mark the api_key as sensitive (at the bottom)
+    ///
+    /// Takes an `api_key` and a `client_version`, and returns a [HeaderMap].
+    pub fn build_studio_headers(&self) -> Result<HeaderMap, RoverClientError> {
+        let mut headers = HeaderMap::new();
+
+        // The headers "apollographql-client-name" and "apollographql-client-version"
+        // are used for client identification in Apollo Studio.
+
+        // This provides metrics in Studio that help keep track of what parts of the schema
+        // Rover uses, which ensures future changes to the API do not break Rover users.
+        // more info here:
+        // https://www.apollographql.com/docs/studio/client-awareness/#using-apollo-server-and-apollo-client
+
+        let client_name = HeaderValue::from_str(CLIENT_NAME)?;
+        headers.insert("apollographql-client-name", client_name);
+        tracing::debug!(?self.version);
+        let client_version = HeaderValue::from_str(&self.version)?;
+        headers.insert("apollographql-client-version", client_version);
+
+        match &self.credential.origin {
+            CredentialOrigin::OauthAuthorizationPkce(_)
+            | CredentialOrigin::OauthClientCredentials => {
+                let mut auth =
+                    HeaderValue::from_str(&format!("Bearer {}", self.credential.api_key))?;
+                auth.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, auth);
+            }
+            CredentialOrigin::EnvVar | CredentialOrigin::ConfigFile(_) => {
+                let mut api_key = HeaderValue::from_str(&self.credential.api_key)?;
+                api_key.set_sensitive(true);
+                headers.insert("x-api-key", api_key);
+            }
+        }
+
+        if self.is_sudo {
+            headers.insert("apollo-sudo", HeaderValue::from_str("true")?);
+        }
+
+        Ok(headers)
+    }
+
+    pub fn get_credential_origin(&self) -> CredentialOrigin {
+        self.credential.origin.clone()
+    }
+
+    /// A Studio GraphQL service that retries on transient failures (timeouts, 5xx, a dropped
+    /// connection) up to [`Self::retry_period`]. Safe only for idempotent operations - see
+    /// [`Self::studio_graphql_service_with_timeout`] for a mutation that must not retry.
+    pub fn studio_graphql_service(
+        &self,
+    ) -> Result<GraphQLService<HttpService>, InitStudioServiceError> {
+        let service = ServiceBuilder::new()
+            .layer(GraphQLLayer::default())
+            .layer(BoxCloneServiceLayer::new(
+                // Inside the box so `HttpService`'s error type - and this function's return
+                // type - stay as they are, and above the retry layer so a rejection is never
+                // handed to the retry policy.
+                ServiceBuilder::new()
+                    .layer(HttpStudioServiceLayer::new(
+                        Url::from_str(&self.graphql_endpoint)?,
+                        self.credential.clone(),
+                        self.version.to_string(),
+                        self.is_sudo,
+                    )?)
+                    .layer(RejectedCredentialLayer::new(self.credential.clone()))
+                    .into_inner(),
+            ))
+            .layer(RetryLayer::new(RetryPolicy::new(self.retry_period)))
+            .service(
+                ReqwestService::builder()
+                    .client(self.reqwest_client.clone())
+                    .build()?,
+            );
+
+        Ok(service)
+    }
+
+    /// A Studio GraphQL service that retries on transient failures up to [`Self::retry_period`],
+    /// the same as [`Self::studio_graphql_service`], but additionally bounds each individual
+    /// attempt by `attempt_timeout` - so one hung attempt gets retried rather than silently
+    /// consuming the whole retry budget on its own. Composes `rover_http`'s
+    /// [`retry_with_attempt_timeout`] rather than the bare [`RetryLayer`] `studio_graphql_service`
+    /// uses, nesting the timeout inside the retry per this repo's composition guidance
+    /// (AGENTS.md). Safe only for idempotent operations, same caveat as `studio_graphql_service`.
+    ///
+    /// Also classifies an HTTP 403 via `PermissionDeniedLayer`, like
+    /// [`Self::studio_graphql_service_with_timeout`]. That's safe here, unlike in the shared
+    /// `studio_graphql_service`, because this constructor's only callers are the client-credential
+    /// pair reads (`pair_list`, `pair_get`), which need a 403 told apart from other failures - in
+    /// particular so `rover api-key delete`/`rename` can fall back to the API-key path when the
+    /// pair lookup is refused (spec FR20). A 403 is never retried either way.
+    pub fn studio_graphql_service_with_attempt_timeout(
+        &self,
+        attempt_timeout: Duration,
+    ) -> Result<GraphQLService<HttpService>, InitStudioServiceError> {
+        let service = ServiceBuilder::new()
+            .layer(GraphQLLayer::default())
+            .layer(BoxCloneServiceLayer::new(
+                // Inside the box so `HttpService`'s error type - and this function's return
+                // type - stay as they are, and above the retry layer so a rejection is never
+                // handed to the retry policy.
+                ServiceBuilder::new()
+                    .layer(HttpStudioServiceLayer::new(
+                        Url::from_str(&self.graphql_endpoint)?,
+                        self.credential.clone(),
+                        self.version.to_string(),
+                        self.is_sudo,
+                    )?)
+                    .layer(RejectedCredentialLayer::new(self.credential.clone()))
+                    .layer(PermissionDeniedLayer)
+                    .into_inner(),
+            ))
+            .layer(retry_with_attempt_timeout(
+                self.retry_period,
+                attempt_timeout,
+            ))
+            .service(
+                ReqwestService::builder()
+                    .client(self.reqwest_client.clone())
+                    .build()?,
+            );
+
+        Ok(service)
+    }
+
+    /// A Studio GraphQL service bounded by a single per-attempt `timeout`, with **no retry** -
+    /// for a non-idempotent mutation where a retried attempt could double the effect of a
+    /// request the server already committed (e.g. `createOAuthClient`, `rotateOAuthClientSecret`,
+    /// `deleteOAuthClient` - see each operation's own `service.rs` for why). A caller that needs
+    /// retry behavior for such an operation must use a policy that only retries failures known to
+    /// precede any server-side effect, not this constructor.
+    pub fn studio_graphql_service_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<GraphQLService<HttpService>, InitStudioServiceError> {
+        let service = ServiceBuilder::new()
+            .layer(GraphQLLayer::default())
+            .layer(BoxCloneServiceLayer::new(
+                // Inside the box so `HttpService`'s error type - and this function's return
+                // type - stay as they are. `PermissionDeniedLayer` only lives here, not in
+                // `studio_graphql_service` - it isn't safe to add to that shared constructor's
+                // ~18 existing callers, since it would intercept a 403 before `GraphQLLayer` (the
+                // layer above this whole bundle) ever parses the response body, discarding
+                // Studio's own GraphQL error message for every operation that doesn't expect
+                // this classification.
+                ServiceBuilder::new()
+                    .layer(HttpStudioServiceLayer::new(
+                        Url::from_str(&self.graphql_endpoint)?,
+                        self.credential.clone(),
+                        self.version.to_string(),
+                        self.is_sudo,
+                    )?)
+                    .layer(RejectedCredentialLayer::new(self.credential.clone()))
+                    .layer(PermissionDeniedLayer)
+                    .into_inner(),
+            ))
+            // No retry layer is present, so unlike `studio_graphql_service`, there's no ordering
+            // question here - `timeout` simply bounds the network call underneath.
+            .layer(TimeoutLayer::new(timeout))
+            .service(
+                ReqwestService::builder()
+                    .client(self.reqwest_client.clone())
+                    .build()?,
+            );
+
+        Ok(service)
+    }
+
+    pub fn http_service(&self) -> Result<HttpService, RoverClientError> {
+        let service = ReqwestService::builder()
+            .client(self.reqwest_client.clone())
+            .build()
+            .map_err(|err| RoverClientError::ServiceReady(Box::new(err)))?
+            .boxed_clone();
+        Ok(service)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use graphql_client::{GraphQLQuery, QueryBody};
+    use httpmock::prelude::*;
+    use rover_graphql::{GraphQLRequest, GraphQLServiceError};
+    use rover_http::HttpServiceError;
+    use rover_studio::service::{
+        permission_denied::permission_denied, rejected_credential::rejected_credential,
+    };
+    use rstest::{fixture, rstest};
+    use serde::{Deserialize, Serialize};
+    use speculoos::prelude::*;
+    use tower::{Service, ServiceExt};
+
+    use super::*;
+
+    #[fixture]
+    fn credential() -> Credential {
+        Credential {
+            api_key: "an-api-key".to_string(),
+            origin: CredentialOrigin::ConfigFile("default".to_string()),
+            expires_at: None,
+        }
+    }
+
+    #[fixture]
+    fn client(credential: Credential) -> StudioClient {
+        StudioClient::new(
+            credential,
+            "https://example.com",
+            "test-version",
+            false,
+            ReqwestClient::new(),
+            Duration::from_secs(1),
+        )
+    }
+
+    // A legacy API key credential should be sent as `x-api-key`, not as a bearer token.
+    #[rstest]
+    fn build_studio_headers_sends_x_api_key_for_a_legacy_api_key(client: StudioClient) {
+        let headers = client.build_studio_headers().unwrap();
+
+        assert_that!(headers.get("x-api-key"))
+            .is_some()
+            .is_equal_to(&HeaderValue::from_static("an-api-key"));
+        assert_that!(headers.get(reqwest::header::AUTHORIZATION)).is_none();
+    }
+
+    // An OAuth token credential should be sent as an `Authorization: Bearer` header, not `x-api-key`.
+    #[rstest]
+    fn build_studio_headers_sends_authorization_bearer_for_an_oauth_token(
+        #[with(Credential {
+            api_key: "an-access-token".to_string(),
+            origin: CredentialOrigin::OauthAuthorizationPkce("default".to_string()),
+            expires_at: None,
+        })]
+        client: StudioClient,
+    ) {
+        let headers = client.build_studio_headers().unwrap();
+
+        assert_that!(headers.get(reqwest::header::AUTHORIZATION))
+            .is_some()
+            .is_equal_to(&HeaderValue::from_static("Bearer an-access-token"));
+        assert_that!(headers.get("x-api-key")).is_none();
+    }
+
+    fn client_with(api_key: &str, origin: CredentialOrigin) -> StudioClient {
+        StudioClient::new(
+            Credential {
+                api_key: api_key.to_string(),
+                origin,
+                expires_at: None,
+            },
+            "https://example.com",
+            "test-version",
+            false,
+            ReqwestClient::new(),
+            Duration::from_secs(1),
+        )
+    }
+
+    #[test]
+    fn a_rejected_credential_is_reported_as_malformed_when_the_key_shape_is_wrong() {
+        let client = client_with("not-a-real-key", CredentialOrigin::EnvVar);
+
+        let refined = client.refine_rejected_credential_error(RoverClientError::InvalidKey);
+
+        assert!(matches!(refined, RoverClientError::MalformedKey));
+    }
+
+    // Revoked, expired, and unrecognized keys all land here.
+    #[test]
+    fn a_rejected_credential_stays_invalid_when_the_key_shape_is_fine() {
+        let client = client_with("user:my-username:secretkey", CredentialOrigin::EnvVar);
+
+        let refined = client.refine_rejected_credential_error(RoverClientError::InvalidKey);
+
+        assert!(matches!(refined, RoverClientError::InvalidKey));
+    }
+
+    #[test]
+    fn a_rejected_oauth_token_is_never_reported_as_malformed() {
+        let client = client_with(
+            "an-access-token",
+            CredentialOrigin::OauthAuthorizationPkce("default".to_string()),
+        );
+
+        let refined = client.refine_rejected_credential_error(RoverClientError::InvalidKey);
+
+        assert!(matches!(refined, RoverClientError::InvalidKey));
+    }
+
+    #[test]
+    fn unrelated_errors_pass_through_untouched() {
+        let client = client_with("not-a-real-key", CredentialOrigin::EnvVar);
+
+        let refined = client.refine_rejected_credential_error(RoverClientError::GraphQl {
+            msg: "Something went wrong".to_string(),
+        });
+
+        assert!(matches!(refined, RoverClientError::GraphQl { .. }));
+    }
+
+    // A minimal hand-written `GraphQLQuery`, the same shape `rover-graphql`'s own tests use, so
+    // these tests can drive `studio_graphql_service_with_timeout`'s real layer stack over an
+    // `httpmock` server without needing a schema-derived operation.
+    struct TestQuery;
+
+    #[derive(Serialize)]
+    struct TestQueryVariables {}
+
+    #[derive(Serialize, Deserialize, Debug)]
+    struct TestQueryResponse {}
+
+    impl GraphQLQuery for TestQuery {
+        type Variables = TestQueryVariables;
+        type ResponseData = TestQueryResponse;
+
+        fn build_query(variables: Self::Variables) -> QueryBody<Self::Variables> {
+            QueryBody {
+                variables,
+                query: "query Test { __typename }",
+                operation_name: "Test",
+            }
+        }
+    }
+
+    fn client_against(server: &MockServer) -> StudioClient {
+        StudioClient::new(
+            Credential {
+                api_key: "an-api-key".to_string(),
+                origin: CredentialOrigin::EnvVar,
+                expires_at: None,
+            },
+            &server.url("/graphql"),
+            "test-version",
+            false,
+            ReqwestClient::new(),
+            Duration::from_secs(1),
+        )
+    }
+
+    fn upstream_http_error<T>(err: &GraphQLServiceError<T>) -> Option<&HttpServiceError>
+    where
+        T: std::fmt::Debug + Send + Sync,
+    {
+        match err {
+            GraphQLServiceError::UpstreamService(source) => {
+                source.downcast_ref::<HttpServiceError>()
+            }
+            _ => None,
+        }
+    }
+
+    async fn call_with_timeout(
+        client: &StudioClient,
+        timeout: Duration,
+    ) -> Result<TestQueryResponse, GraphQLServiceError<TestQueryResponse>> {
+        let mut service = client.studio_graphql_service_with_timeout(timeout).unwrap();
+        let service = ServiceExt::<GraphQLRequest<TestQuery>>::ready(&mut service)
+            .await
+            .unwrap();
+        service
+            .call(GraphQLRequest::<TestQuery>::new(TestQueryVariables {}))
+            .await
+    }
+
+    // The core no-retry guarantee `studio_graphql_service_with_timeout` exists for: a 5xx is
+    // never replayed, unlike `studio_graphql_service`'s ambient retry.
+    #[tokio::test]
+    async fn a_5xx_is_sent_exactly_once() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(500);
+        });
+
+        let result = call_with_timeout(&client_against(&server), Duration::from_secs(5)).await;
+
+        assert_that!(result).is_err();
+        assert_that!(mock.calls()).is_equal_to(1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_response_times_out_around_the_given_duration() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(200).delay(Duration::from_secs(5));
+        });
+
+        let started = Instant::now();
+        // Guards the test itself against hanging forever if the timeout layer has a bug -
+        // well outside the 200ms timeout under test.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            call_with_timeout(&client_against(&server), Duration::from_millis(200)),
+        )
+        .await
+        .expect("studio_graphql_service_with_timeout should have given up well before this");
+
+        assert_that!(result).is_err();
+        assert_that!(started.elapsed() < Duration::from_secs(1)).is_true();
+    }
+
+    #[tokio::test]
+    async fn a_403_is_classified_as_permission_denied_through_the_real_stack() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(403);
+        });
+
+        let err = call_with_timeout(&client_against(&server), Duration::from_secs(5))
+            .await
+            .expect_err("a 403 should have become an error");
+
+        assert_that!(upstream_http_error(&err).and_then(permission_denied)).is_some();
+        assert_that!(mock.calls()).is_equal_to(1);
+    }
+
+    // Confirms `PermissionDeniedLayer` and `RejectedCredentialLayer` still compose correctly
+    // together - a 401 stays a credential rejection, not a permission denial.
+    #[tokio::test]
+    async fn a_401_still_classifies_as_rejected_credential_through_the_real_stack() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(401);
+        });
+
+        let err = call_with_timeout(&client_against(&server), Duration::from_secs(5))
+            .await
+            .expect_err("a 401 should have become an error");
+
+        assert_that!(upstream_http_error(&err).and_then(rejected_credential)).is_some();
+    }
+
+    // `studio_graphql_service_with_attempt_timeout` serves the pair reads, which need a 403
+    // classified (spec FR20's fall-back for `rover api-key delete`/`rename`) - and, unlike a 5xx,
+    // a refusal must not be retried, since retrying can't change the answer.
+    #[tokio::test]
+    async fn the_attempt_timeout_service_classifies_a_403_without_retrying_it() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/graphql");
+            then.status(403);
+        });
+
+        let mut service = client_against(&server)
+            .studio_graphql_service_with_attempt_timeout(Duration::from_secs(5))
+            .unwrap();
+        let service = ServiceExt::<GraphQLRequest<TestQuery>>::ready(&mut service)
+            .await
+            .unwrap();
+        let err = service
+            .call(GraphQLRequest::<TestQuery>::new(TestQueryVariables {}))
+            .await
+            .expect_err("a 403 should have become an error");
+
+        assert_that!(upstream_http_error(&err).and_then(permission_denied)).is_some();
+        assert_that!(mock.calls()).is_equal_to(1);
+    }
+}

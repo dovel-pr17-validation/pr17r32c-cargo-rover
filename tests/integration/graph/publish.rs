@@ -1,0 +1,375 @@
+use std::fs;
+
+use assert_cmd::Command;
+use httpmock::{Method::POST, MockServer};
+use insta::assert_json_snapshot;
+use serde_json::Value;
+use serial_test::serial;
+
+const PUBLISH_WITH_LAUNCH_RESPONSE: &str = r#"{"data":{"graph":{"uploadSchema":{
+    "code":"IT_WERK",
+    "message":"published",
+    "success":true,
+    "publication":{
+        "variant":{"name":"current","latestLaunch":{"id":"launch-1"}},
+        "schema":{"hash":"123456"},
+        "diffToPrevious":null
+    }
+}}}}"#;
+
+const LAUNCH_STATUS_RESPONSE: &str = r#"{"data":{"graph":{"variant":{"launch":{
+    "id":"launch-1",
+    "graphId":"my-graph",
+    "graphVariant":"current",
+    "status":"LAUNCH_COMPLETED",
+    "downstreamLaunches":[{
+        "id":"launch-2",
+        "graphId":"my-graph",
+        "graphVariant":"mobile",
+        "status":"LAUNCH_COMPLETED"
+    }]
+}}}}}"#;
+
+const LAUNCH_STATUS_WITH_FAILED_DOWNSTREAM_LAUNCH_RESPONSE: &str = r#"{"data":{"graph":{"variant":{"launch":{
+    "id":"launch-1",
+    "graphId":"my-graph",
+    "graphVariant":"current",
+    "status":"LAUNCH_COMPLETED",
+    "downstreamLaunches":[{
+        "id":"launch-2",
+        "graphId":"my-graph",
+        "graphVariant":"mobile",
+        "status":"LAUNCH_FAILED"
+    }]
+}}}}}"#;
+
+const LAUNCH_STATUS_STILL_RUNNING_RESPONSE: &str = r#"{"data":{"graph":{"variant":{"launch":{
+    "id":"launch-1",
+    "graphId":"my-graph",
+    "graphVariant":"current",
+    "status":"LAUNCH_INITIATED",
+    "supersededAt":null,
+    "downstreamLaunches":[]
+}}}}}"#;
+
+/// Runs `rover graph publish` against a mock Studio server stubbing the
+/// publish mutation (returning a `latestLaunch.id`) and the launch status
+/// poll query (returning `launch_status_response`), with the given extra CLI
+/// args, and returns the process output.
+fn run_graph_publish(launch_status_response: &str, extra_args: &[&str]) -> std::process::Output {
+    let server = MockServer::start();
+
+    let mutation_mock = server.mock(|when, then| {
+        when.method(POST).body_includes("GraphPublishMutation");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(PUBLISH_WITH_LAUNCH_RESPONSE);
+    });
+    let launch_status_mock = server.mock(|when, then| {
+        when.method(POST)
+            .body_includes("GraphPublishLaunchStatusQuery");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(launch_status_response);
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let schema = temp.path().join("schema.graphql");
+    fs::write(&schema, "type Query { hello: String }").unwrap();
+
+    let output = Command::cargo_bin("rover")
+        .unwrap()
+        .env("APOLLO_KEY", "testkey")
+        .env("APOLLO_REGISTRY_URL", server.base_url())
+        .arg("graph")
+        .arg("publish")
+        .arg("my-graph@current")
+        .arg("--schema")
+        .arg(&schema)
+        .args(extra_args)
+        .output()
+        .unwrap();
+
+    mutation_mock.assert();
+    launch_status_mock.assert();
+    output
+}
+
+/// Verifies that `rover graph publish`'s text output (stderr) reports a
+/// contract-variant downstream launch triggered by the publish -- the
+/// end-to-end path for ROVER-461, exercising the real CLI, the extended
+/// publish mutation (grabbing `latestLaunch.id` for free), and the new
+/// launch status poll query.
+#[test]
+#[serial]
+fn graph_publish_reports_triggered_downstream_launches_in_text() {
+    let output = run_graph_publish(LAUNCH_STATUS_RESPONSE, &[]);
+
+    assert!(
+        output.status.success(),
+        "expected a zero exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Triggered downstream launches for 1 contract variant: mobile."),
+        "stderr did not contain the expected launch line: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "View launch details at: https://studio.apollographql.com/graph/my-graph/launches/launch-1"
+        ),
+        "stderr did not contain the expected launch link: {stderr}"
+    );
+}
+
+/// Same scenario as above, but verifying the JSON output shape (`--format
+/// json` skips `text()`/stderr rendering entirely and goes through the
+/// separate `json()` path, so this needs its own run).
+#[test]
+#[serial]
+fn graph_publish_reports_triggered_downstream_launches_in_json() {
+    let output = run_graph_publish(LAUNCH_STATUS_RESPONSE, &["--format", "json"]);
+
+    assert!(
+        output.status.success(),
+        "expected a zero exit code; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_snapshot!(json);
+}
+
+/// Verifies that `rover graph publish --include-contract-checks` exits non-zero and reports
+/// which contract variant's downstream launch failed, even though the schema
+/// publish itself succeeded -- the outcome is carried as data on
+/// `GraphPublishResponse`, not as an `Err` from `publish::run`, and
+/// `PublishLaunchesOutput` (used inline by `Publish::run`) is what turns a
+/// `FAILED` status into the command's actual non-zero exit.
+#[test]
+#[serial]
+fn graph_publish_fails_when_a_downstream_launch_fails() {
+    let output = run_graph_publish(
+        LAUNCH_STATUS_WITH_FAILED_DOWNSTREAM_LAUNCH_RESPONSE,
+        &["--include-contract-checks"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "expected a nonzero exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("downstream contract launch failed: mobile"),
+        "stderr did not contain the expected failure detail: {stderr}"
+    );
+}
+
+/// Same failure scenario as above, but verifying `--format json` still
+/// carries the full publish response as `data` (rather than `null`) and a
+/// matching `error.code`, via `RoverClientError::PublishLaunchFailure`.
+#[test]
+#[serial]
+fn graph_publish_json_includes_data_and_error_code_when_a_downstream_launch_fails() {
+    let output = run_graph_publish(
+        LAUNCH_STATUS_WITH_FAILED_DOWNSTREAM_LAUNCH_RESPONSE,
+        &["--format", "json", "--include-contract-checks"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "expected a nonzero exit code; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_snapshot!(json);
+}
+
+/// `--check` gates the publish on the check's result, so there is nothing for `--background`
+/// (start the check and don't wait for it) to mean here; it belongs to `graph check`. 0.x
+/// accepted it here anyway, so it's still accepted, with a warning that it has moved, and the
+/// publish goes ahead as usual.
+#[test]
+#[serial]
+fn background_is_accepted_with_a_deprecation_warning() {
+    let output = run_graph_publish(LAUNCH_STATUS_RESPONSE, &["--background"]);
+
+    assert!(
+        output.status.success(),
+        "expected a zero exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Warning: `--background` has moved to `rover graph check --background`, and will be removed from `rover graph publish` in a future version. It has no effect here: `publish --check` always waits for the check, because the check decides whether the publish happens."
+        ),
+        "stderr did not contain the deprecation warning: {stderr}"
+    );
+}
+
+/// Deprecated, so it isn't offered in `--help`.
+#[test]
+fn background_is_not_listed_in_publish_help() {
+    let output = Command::cargo_bin("rover")
+        .unwrap()
+        .args(["graph", "publish", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("--background"));
+}
+
+/// Without `--include-contract-checks`, a failed downstream contract-variant launch is a warning,
+/// not a failure: the schema was published, and 0.x didn't fail on a contract variant's launch.
+#[test]
+#[serial]
+fn graph_publish_warns_when_a_downstream_launch_fails_without_include_contract_checks() {
+    let output = run_graph_publish(LAUNCH_STATUS_WITH_FAILED_DOWNSTREAM_LAUNCH_RESPONSE, &[]);
+
+    assert!(
+        output.status.success(),
+        "expected a zero exit code; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Warning: The publish succeeded, but a downstream contract launch failed: mobile. Pass --include-contract-checks to make this fail the command."
+        ),
+        "stderr did not contain the expected warning: {stderr}"
+    );
+}
+
+/// Same scenario as above with `--format json`: no `error`, and the failed launch is still in
+/// `data.downstream_launches`.
+#[test]
+#[serial]
+fn graph_publish_json_reports_a_failed_downstream_launch_without_an_error_without_include_contract_checks()
+ {
+    let output = run_graph_publish(
+        LAUNCH_STATUS_WITH_FAILED_DOWNSTREAM_LAUNCH_RESPONSE,
+        &["--format", "json"],
+    );
+
+    assert!(
+        output.status.success(),
+        "expected a zero exit code; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_snapshot!(json);
+}
+
+/// When Rover stops waiting for the launch (E065), the schema was still published, so
+/// `--format json` keeps the publish response in `data`, as it does for a failed launch (E047),
+/// with `launch_status: null` since Rover never learned the outcome.
+#[test]
+#[serial]
+fn graph_publish_json_keeps_the_publish_response_when_the_launch_wait_times_out() {
+    let output = run_graph_publish(
+        LAUNCH_STATUS_STILL_RUNNING_RESPONSE,
+        &["--format", "json", "--checks-timeout", "0"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "expected exit code 1; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_snapshot!(json);
+}
+
+/// A failed `--check` stops the publish with the check commands' E043, and `--format json`
+/// reports the check result as `data` (`json_version` "3", the check's shape), rather than an
+/// uncoded error with `data: null`.
+#[test]
+#[serial]
+fn graph_publish_check_failure_is_e043_with_the_check_result() {
+    let server = MockServer::start();
+    let submission_mock = server.mock(|when, then| {
+        when.method(POST).body_includes("GraphCheckMutation");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"data":{"graph":{"variant":{"submitCheckSchemaAsync":{
+                    "__typename":"CheckRequestSuccess",
+                    "targetURL":"https://studio.apollographql.com/graph/my-graph/checks/1",
+                    "workflowID":"workflow-1"
+                }}}}}"#,
+            );
+    });
+    let status_mock = server.mock(|when, then| {
+        when.method(POST)
+            .body_includes("GraphCheckWorkflowStatusQuery");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"data":{"graph":{"checkWorkflow":{"status":"FAILED","tasks":[]}}}}"#);
+    });
+    let fetch_mock = server.mock(|when, then| {
+        when.method(POST).body_includes("GraphCheckWorkflowQuery");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(
+                r#"{"data":{"graph":{"checkWorkflow":{
+            "status":"FAILED",
+            "tasks":[{
+                "__typename":"DownstreamCheckTask",
+                "status":"FAILED",
+                "targetURL":"https://studio.apollographql.com/graph/my-graph/checks/downstream",
+                "results":[{
+                    "__typename":"DownstreamCheckResult",
+                    "blocking":true,
+                    "downstreamGraphID":"my-graph",
+                    "downstreamVariantName":"mobile",
+                    "downstreamWorkflow":{"status":"FAILED"},
+                    "failsUpstreamWorkflow":true
+                }]
+            }]
+        }}}}"#,
+            );
+    });
+    let publish_mock = server.mock(|when, then| {
+        when.method(POST).body_includes("GraphPublishMutation");
+        then.status(500);
+    });
+
+    let temp = tempfile::tempdir().unwrap();
+    let schema = temp.path().join("schema.graphql");
+    fs::write(&schema, "type Query { hello: String }").unwrap();
+
+    let output = Command::cargo_bin("rover")
+        .unwrap()
+        .env("APOLLO_KEY", "testkey")
+        .env("APOLLO_REGISTRY_URL", server.base_url())
+        .args(["graph", "publish", "my-graph@current", "--check"])
+        .arg("--schema")
+        .arg(&schema)
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+
+    submission_mock.assert();
+    status_mock.assert();
+    fetch_mock.assert();
+    publish_mock.assert_calls(0);
+
+    assert!(
+        !output.status.success(),
+        "expected a nonzero exit code; stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_json_snapshot!(json);
+}

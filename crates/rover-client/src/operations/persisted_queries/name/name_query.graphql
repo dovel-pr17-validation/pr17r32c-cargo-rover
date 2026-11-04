@@ -1,0 +1,8 @@
+query PersistedQueryListNameQuery($graphId: ID!, $listId: ID!) {
+  frontendUrlRoot
+  graph(id: $graphId) {
+    persistedQueryList(id: $listId) {
+      name
+    }
+  }
+}

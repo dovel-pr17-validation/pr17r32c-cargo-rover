@@ -1,0 +1,25 @@
+use anyhow::anyhow;
+use camino::Utf8PathBuf;
+use rover_print::print::Print;
+use timber::Level;
+
+use crate::{
+    RoverError, RoverOutput, RoverResult, command::dev::Dev, options::ProfileOpt,
+    utils::client::StudioClientConfig,
+};
+
+impl Dev {
+    pub async fn run(
+        &self,
+        _override_install_path: Option<Utf8PathBuf>,
+        _client_config: StudioClientConfig,
+        _log_level: Option<Level>,
+        _profile: &ProfileOpt,
+        _stderr: &impl Print,
+        _graph_ref: Option<String>,
+    ) -> RoverResult<RoverOutput> {
+        Err(RoverError::new(anyhow!(
+            "rover dev is not supported on this platform"
+        )))
+    }
+}

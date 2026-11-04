@@ -1,0 +1,108 @@
+use clap::Parser;
+use config::Profile;
+use dialoguer::{Password, theme::ColorfulTheme};
+use houston::{self as config, ApiKey, ApiKeyActor, MalformedApiKey};
+use rover_std::hyperlink;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    RoverResult,
+    command::init::authentication::{AuthenticationError, auth_error_to_rover_error},
+    options::ProfileOpt,
+    utils::client::StudioClientConfig,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Parser, Default)]
+pub struct ProjectAuthenticationOpt {}
+
+impl ProjectAuthenticationOpt {
+    pub fn prompt_for_api_key(
+        &self,
+        client_config: &StudioClientConfig,
+        profile: &ProfileOpt,
+    ) -> RoverResult<()> {
+        println!(
+            "No credentials found. Please go to {} and create a new Personal API key.",
+            hyperlink("https://go.apollo.dev/r/init")
+        );
+        println!();
+        println!("Copy the key and paste it into the prompt below.");
+        println!();
+        let theme = ColorfulTheme::default();
+
+        let password_result = Password::with_theme(&theme)
+            .allow_empty_password(false)
+            .report(true)
+            .interact();
+
+        let api_key = match password_result {
+            Ok(input) => {
+                // Store what we validated: the key was previously checked trimmed and saved
+                // untrimmed, so a pasted trailing newline reached the request headers.
+                let input = input.trim().to_string();
+                if input.is_empty() {
+                    return Err(auth_error_to_rover_error(AuthenticationError::EmptyKey));
+                }
+
+                // Parsing tells the two failures apart, which `starts_with` couldn't: a garbled
+                // key needs replacing, while a graph key needs the `APOLLO_KEY` guidance that
+                // `NotUserKey` carries.
+                match ApiKey::try_from(input.as_str()) {
+                    Err(MalformedApiKey) => {
+                        return Err(auth_error_to_rover_error(
+                            AuthenticationError::InvalidKeyFormat,
+                        ));
+                    }
+                    Ok(key) if key.actor() != ApiKeyActor::User => {
+                        return Err(auth_error_to_rover_error(AuthenticationError::NotUserKey));
+                    }
+                    Ok(_) => {}
+                }
+
+                input
+            }
+            Err(e) => {
+                return Err(auth_error_to_rover_error(AuthenticationError::SystemError(
+                    e.to_string(),
+                )));
+            }
+        };
+
+        let profile_handle = Profile::new(&profile.profile_name, &client_config.config);
+        profile_handle.set_api_key(&api_key).map_err(|e| {
+            auth_error_to_rover_error(AuthenticationError::SystemError(e.to_string()))
+        })?;
+
+        // Validate key was stored successfully
+        match profile_handle.get_credential() {
+            Ok(credential) => {
+                if credential.api_key.is_empty() || credential.api_key != api_key {
+                    return Err(auth_error_to_rover_error(AuthenticationError::SystemError(
+                        "Received an unexpected server error.".to_string(),
+                    )));
+                }
+
+                match client_config.get_authenticated_client(profile) {
+                    // Saved, not yet accepted: the caller confirms it with the registry and
+                    // says so, or removes it.
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // If authentication fails, remove the key
+                        profile_handle.set_api_key("").map_err(|e| {
+                            auth_error_to_rover_error(AuthenticationError::SystemError(
+                                e.to_string(),
+                            ))
+                        })?;
+
+                        Err(auth_error_to_rover_error(
+                            AuthenticationError::AuthenticationFailed(e.to_string()),
+                        ))
+                    }
+                }
+            }
+            Err(e) => Err(auth_error_to_rover_error(AuthenticationError::SystemError(
+                format!("Failed to validate the stored API key: {e}"),
+            ))),
+        }
+    }
+}

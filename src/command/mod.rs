@@ -1,0 +1,61 @@
+// `pub(crate)`, not the default private `mod`, so `crate::error::mod`'s special-casing of
+// `RoverClientError::PairListFailure` can reach `api_key::list::output`'s render helpers.
+pub(crate) mod api_key;
+pub mod auth;
+pub(crate) mod check_output;
+mod client;
+mod completion;
+mod config;
+#[cfg(feature = "composition-js")]
+pub mod connector;
+mod contract;
+mod dev;
+mod docs;
+mod explain;
+mod graph;
+mod graph_artifact;
+mod info;
+pub(crate) mod init;
+pub(crate) mod install;
+mod license;
+#[cfg(feature = "composition-js")]
+mod lsp;
+pub(crate) mod output;
+mod persisted_queries;
+pub(crate) mod plugin;
+pub(crate) mod publish_launches_output;
+mod readme;
+mod schema;
+pub(crate) mod subgraph;
+pub(crate) mod supergraph;
+pub(crate) mod template;
+mod update;
+
+pub use api_key::ApiKeys;
+pub use auth::Auth;
+pub use client::Client;
+pub use completion::Completion;
+pub use config::Config;
+#[cfg(feature = "composition-js")]
+pub use connector::Connector;
+pub use contract::Contract;
+pub use dev::Dev;
+pub use docs::Docs;
+pub use explain::Explain;
+pub use graph::Graph;
+pub use graph_artifact::GraphArtifact;
+pub use info::Info;
+pub use init::Init;
+pub use install::Install;
+pub use license::License;
+#[cfg(feature = "composition-js")]
+pub use lsp::Lsp;
+pub use output::{CliOutput, RoverOutput};
+pub use persisted_queries::PersistedQueries;
+pub use plugin::{LockfileWrite, Plugins};
+pub use readme::Readme;
+pub use schema::Schema;
+pub use subgraph::Subgraph;
+pub use supergraph::Supergraph;
+pub use template::Template;
+pub use update::Update;

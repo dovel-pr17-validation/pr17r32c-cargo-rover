@@ -1,0 +1,257 @@
+//! Provides middleware that injects studio headers into all requests
+
+pub mod permission_denied;
+pub mod rejected_credential;
+
+use std::str::FromStr;
+
+use buildstructor::buildstructor;
+use houston::{Credential, CredentialOrigin};
+use http::{HeaderMap, HeaderValue, Uri};
+use rover_http::HttpRequest;
+use tower::{Layer, Service};
+use url::Url;
+
+const CLIENT_NAME: &str = "rover-client";
+
+/// Errors occur when a HttpStudioService fails to be created
+#[derive(thiserror::Error, Debug)]
+pub enum HttpStudioServiceError {
+    /// Caused when a HttpStudioService fails to build due to an invalid [`HeaderValue`]
+    #[error(transparent)]
+    InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
+    /// Caused when a HttpStudioService fails to build due to an invalid [`Uri`]
+    #[error(transparent)]
+    InvalidUri(#[from] http::uri::InvalidUri),
+}
+
+/// Layer providing middleware that injects studio headers to all requests
+pub struct HttpStudioServiceLayer {
+    headers: HeaderMap,
+    uri: Uri,
+}
+
+#[buildstructor]
+impl HttpStudioServiceLayer {
+    /// Constructs a new [`HttpStudioServiceLayer`]
+    #[builder]
+    pub fn new(
+        url: Url,
+        credential: Credential,
+        client_version: String,
+        is_sudo: bool,
+    ) -> Result<HttpStudioServiceLayer, HttpStudioServiceError> {
+        let mut headers = HeaderMap::new();
+
+        // The headers "apollographql-client-name" and "apollographql-client-version"
+        // are used for client identification in Apollo Studio.
+
+        // This provides metrics in Studio that help keep track of what parts of the schema
+        // Rover uses, which ensures future changes to the API do not break Rover users.
+        // more info here:
+        // https://www.apollographql.com/docs/studio/client-awareness/#using-apollo-server-and-apollo-client
+        let client_name = HeaderValue::from_static(CLIENT_NAME);
+        headers.insert("apollographql-client-name", client_name);
+        tracing::debug!(?client_version);
+        let client_version = HeaderValue::from_str(&client_version)?;
+        headers.insert("apollographql-client-version", client_version);
+
+        match &credential.origin {
+            CredentialOrigin::OauthAuthorizationPkce(_)
+            | CredentialOrigin::OauthClientCredentials => {
+                let mut auth = HeaderValue::from_str(&format!("Bearer {}", credential.api_key))?;
+                auth.set_sensitive(true);
+                headers.insert(http::header::AUTHORIZATION, auth);
+            }
+            CredentialOrigin::EnvVar | CredentialOrigin::ConfigFile(_) => {
+                let mut api_key = HeaderValue::from_str(&credential.api_key)?;
+                api_key.set_sensitive(true);
+                headers.insert("x-api-key", api_key);
+            }
+        }
+
+        if is_sudo {
+            headers.insert("apollo-sudo", HeaderValue::from_static("true"));
+        }
+        let uri = Uri::from_str(url.as_ref())?;
+        Ok(HttpStudioServiceLayer { headers, uri })
+    }
+}
+
+impl<S: Clone> Layer<S> for HttpStudioServiceLayer {
+    type Service = HttpStudioService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HttpStudioService {
+            headers: self.headers.clone(),
+            uri: self.uri.clone(),
+            inner,
+        }
+    }
+}
+
+/// Service that embeds required headers and endpoint into HTTP Requests to Apollo Studio
+#[derive(Clone)]
+pub struct HttpStudioService<S: Clone> {
+    headers: HeaderMap,
+    uri: Uri,
+    inner: S,
+}
+
+impl<S> Service<HttpRequest> for HttpStudioService<S>
+where
+    S: Service<HttpRequest> + Clone,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+    fn call(&mut self, mut req: HttpRequest) -> Self::Future {
+        *req.uri_mut() = self.uri.clone();
+        let headers = req.headers_mut();
+        for (name, value) in self.headers.iter() {
+            headers.insert(name.clone(), value.clone());
+        }
+        self.inner.call(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        str::FromStr,
+        sync::{Arc, Mutex},
+    };
+
+    use anyhow::Result;
+    use bytes::Bytes;
+    use houston::{Credential, CredentialOrigin};
+    use http::{HeaderMap, HeaderValue, Method, StatusCode};
+    use http_body_util::Full;
+    use rover_http::test::MockHttpService;
+    use rover_tower::test::{expect_poll_ready, MockCloneService};
+    use rstest::{fixture, rstest};
+    use speculoos::prelude::*;
+    use tower::{Layer, ServiceExt};
+    use url::Url;
+
+    use crate::service::HttpStudioServiceLayer;
+
+    #[fixture]
+    fn credential() -> Credential {
+        Credential {
+            api_key: "api_key".to_string(),
+            origin: CredentialOrigin::EnvVar,
+            expires_at: None,
+        }
+    }
+
+    #[fixture]
+    fn client_version() -> String {
+        "client_version".to_string()
+    }
+
+    #[fixture]
+    fn studio_endpoint() -> Url {
+        Url::from_str("https://example.com").unwrap()
+    }
+
+    /// Wraps a [`MockHttpService`] (via [`MockCloneService`]) in the layer under test, sends one
+    /// request through it, and returns the headers the mock actually received - so tests can
+    /// assert on what the layer injects without spawning a task to drive a mock handle.
+    fn headers_seen_by_inner_service(
+        studio_endpoint: Url,
+        credential: Credential,
+        client_version: String,
+        is_sudo: bool,
+    ) -> Result<HeaderMap> {
+        let captured = Arc::new(Mutex::new(None));
+        let captured_in_mock = captured.clone();
+
+        let mut mock = MockHttpService::new();
+        expect_poll_ready!(mock);
+        mock.expect_call().returning(move |req| {
+            *captured_in_mock.lock().unwrap() = Some(req.headers().clone());
+            futures::future::ready(Ok(http::Response::builder()
+                .status(StatusCode::CREATED)
+                .body(Full::new(Bytes::default()))
+                .unwrap()))
+        });
+
+        let service =
+            HttpStudioServiceLayer::new(studio_endpoint, credential, client_version, is_sudo)?
+                .layer(MockCloneService::new(mock));
+
+        let req = http::Request::builder()
+            .uri("https://example.com")
+            .method(Method::POST)
+            .body(Full::default())?;
+
+        let result = futures::executor::block_on(service.oneshot(req));
+        assert_that!(result)
+            .is_ok()
+            .matches(|resp| resp.status() == StatusCode::CREATED);
+
+        let headers = captured.lock().unwrap().take().unwrap();
+        Ok(headers)
+    }
+
+    // The layer should inject client identification and x-api-key headers on every
+    // request, plus apollo-sudo when the credential is a sudo one.
+    #[rstest]
+    #[case::is_sudo(true)]
+    #[case::is_not_sudo(false)]
+    fn test_studio_layer(
+        studio_endpoint: Url,
+        credential: Credential,
+        client_version: String,
+        #[case] is_sudo: bool,
+    ) -> Result<()> {
+        let expected_client_version_header = HeaderValue::from_str(&client_version)?;
+        let headers =
+            headers_seen_by_inner_service(studio_endpoint, credential, client_version, is_sudo)?;
+
+        assert_that!(headers.get("apollographql-client-version"))
+            .is_some()
+            .is_equal_to(&expected_client_version_header);
+        assert_that!(headers.get("apollographql-client-name"))
+            .is_some()
+            .is_equal_to(&HeaderValue::from_static("rover-client"));
+        assert_that!(headers.get("x-api-key"))
+            .is_some()
+            .is_equal_to(&HeaderValue::from_static("api_key"));
+        if is_sudo {
+            assert_that!(headers.get("apollo-sudo"))
+                .is_some()
+                .is_equal_to(&HeaderValue::from_static("true"));
+        }
+        Ok(())
+    }
+
+    // An OAuth credential should be sent as an `Authorization: Bearer` header instead
+    // of `x-api-key`.
+    #[rstest]
+    fn test_studio_layer_sends_bearer_for_an_oauth_credential(
+        studio_endpoint: Url,
+        client_version: String,
+    ) -> Result<()> {
+        let credential = Credential {
+            api_key: "an-access-token".to_string(),
+            origin: CredentialOrigin::OauthAuthorizationPkce("default".to_string()),
+            expires_at: None,
+        };
+        let headers =
+            headers_seen_by_inner_service(studio_endpoint, credential, client_version, false)?;
+
+        assert_that!(headers.get(http::header::AUTHORIZATION))
+            .is_some()
+            .is_equal_to(&HeaderValue::from_static("Bearer an-access-token"));
+        assert_that!(headers.get("x-api-key")).is_none();
+        Ok(())
+    }
+}

@@ -1,0 +1,43 @@
+---
+title: Rover install Command
+subtitle: Install or upgrade Rover
+description: Use the rover install command to reinstall or upgrade the Rover binary. To install plugins such as the supergraph binary, Router, and Apollo MCP Server, use rover plugin install.
+---
+
+The `rover install` command reinstalls or upgrades the Rover binary.
+
+To install the plugins Rover uses for composition and local development, use [`rover plugin install`](/rover/commands/plugin).
+
+## Install Rover
+
+When you run `rover install` without the `--plugin` option, it reinstalls or upgrades the Rover binary. The [`curl` (Linux and macOS)](/rover/getting-started#linux--macos-installer) and [PowerShell (Windows)](/rover/getting-started#windows-powershell-installer) install scripts use the same behavior.
+
+```bash
+rover install
+```
+
+If Rover is already installed at the same location, Rover prompts you to confirm overwriting. To overwrite without prompting (for example, when using this command in a CI environment), use `--force`:
+
+```bash
+rover install --force
+```
+
+To install Rover for the first time, [use the official installation methods](/rover/getting-started#installation-methods).
+
+## Install plugins
+
+`rover install --plugin <NAME>@<VERSION>` still works, but it's deprecated. Use [`rover plugin install`](/rover/commands/plugin) instead. The deprecated form prints a warning naming the replacement:
+
+```
+warning: `rover install --plugin` is deprecated. Use `rover plugin install supergraph@=2.9.3` instead.
+```
+
+## Options
+
+| Option | Description |
+| ------ | ----------- |
+| `-f`, `--force` | Overwrite any existing binary without prompting for confirmation. |
+| `--plugin <PLUGIN>` | Deprecated. Use [`rover plugin install`](/rover/commands/plugin) instead. |
+| `--elv2-license <ELV2_LICENSE_ACCEPTED>` | Accept the ELv2 license without prompting, when installing a plugin with the deprecated `--plugin` option. Expected value: `accept`. You can also set this using the `APOLLO_ELV2_LICENSE` environment variable. |
+
+Other common Rover options (e.g. `--log`, `--format`, `--client-timeout`) also apply. Run `rover install --help` for the full list.

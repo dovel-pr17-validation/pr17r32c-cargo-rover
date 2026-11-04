@@ -1,0 +1,209 @@
+---
+title: Installing Rover
+subtitle: Rover CLI installation guide for Linux, Mac, and Windows
+Description: Learn how to install Rover CLI on Linux, Mac, and Windows with step-by-step instructions. Optimize your GraphQL graph management today.
+---
+
+The Rover CLI is available for Linux, Mac, and Windows.
+
+## Installation Methods
+
+### Linux / MacOS installer
+
+To install or upgrade to the **latest release** of Rover:
+
+```bash
+curl -sSL https://rover.apollo.dev/nix/latest | sh
+```
+
+To install or upgrade to a **specific version** of Rover (recommended for CI environments to ensure predictable behavior):
+
+```bash
+# Note the `v` prefixing the version number
+curl -sSL https://rover.apollo.dev/nix/v1.0.1 | sh
+```
+
+If your machine doesn't have the `curl` command, you can get the latest version from the [`curl` downloads page](https://curl.se/download.html).
+
+<Note>
+
+The `rover supergraph compose` command is not yet available for Alpine Linux. You can track the progress for supporting this command on Alpine in [this issue](https://github.com/apollographql/rover/issues/537).
+
+</Note>
+
+### Windows PowerShell installer
+
+To install or upgrade to the **latest release** of Rover:
+
+```bash
+iwr 'https://rover.apollo.dev/win/latest' | iex
+```
+
+To install or upgrade to a **specific version** of Rover (recommended for CI environments to ensure predictable behavior):
+
+```bash
+# Note the `v` prefixing the version number
+iwr 'https://rover.apollo.dev/win/v1.0.1' | iex
+```
+
+#### Installing from a binary mirror using the bash and PowerShell scripts
+
+Both the bash and powershell scripts support the `APOLLO_ROVER_BINARY_DOWNLOAD_PREFIX` environment variable,
+which defaults to `https://github.com/apollographql/rover/releases/download`.
+
+This can be set in your environment to specify a remote mirror or proxy to a GitHub release download URL for the Apollo Rover GitHub repository.
+
+For example, if your remote host is `my-mirror-proxy.com/artifacts/github-com`:
+
+- From a bash shell:
+
+```bash
+# for bash (Mac/Linux)
+export APOLLO_ROVER_BINARY_DOWNLOAD_PREFIX="https://my-mirror-proxy.com/artifacts/github-com/apollographql/rover/releases/download"
+```
+
+- From a PowerShell:
+
+```powershell
+# for PowerShell (Windows)
+$env:APOLLO_ROVER_BINARY_DOWNLOAD_PREFIX = "https://my-mirror-proxy.com/artifacts/github-com/apollographql/rover/releases/download"
+```
+
+This variable also supports basic authentication.
+Set the format of the URL to `https://<username>:<password>@<remote-host>/apollographql/rover/releases/download`
+
+### Docker image
+
+Starting with Rover v0.39.1, Apollo publishes a Linux container image with each release. The image's default entry point is `rover`, so any arguments you pass to `docker run` are forwarded to the CLI. Each version tag is enforced as immutable, so a pinned tag can't change transparently.
+
+Pull from either GitHub Container Registry or Docker Hub:
+
+```bash
+docker pull ghcr.io/apollographql/rover:1.0.1
+# or
+docker pull apollograph/rover:1.0.1
+```
+
+Then run any Rover command:
+
+```bash
+docker run --rm \
+  -e APOLLO_KEY \
+  -v "$PWD:/workspace" -w /workspace \
+  ghcr.io/apollographql/rover:1.0.1 \
+  subgraph check my-graph@prod --name products --schema ./schema.graphql
+```
+
+- `-e APOLLO_KEY` forwards your API key from the host environment.
+- `-v "$PWD:/workspace" -w /workspace` mounts your project so Rover can read your schema files.
+
+Authenticate with a [client-credential pair](/rover/commands/api-key#client-credential-pairs) instead of an API key by forwarding `APOLLO_CLIENT_ID` and `APOLLO_CLIENT_SECRET`:
+
+```bash
+docker run --rm \
+  -e APOLLO_CLIENT_ID -e APOLLO_CLIENT_SECRET \
+  -v "$PWD:/workspace" -w /workspace \
+  ghcr.io/apollographql/rover:1.0.1 \
+  subgraph check my-graph@prod --name products --schema ./schema.graphql
+```
+
+The image doesn't include any plugins. A plugin installed globally in one `docker run` is gone by the next, so install plugins into your mounted project instead, where they persist between runs. For example, with a project that [declares its plugins](/rover/commands/plugin#installing-everything-a-project-declares) in `.rover/rover.yaml`:
+
+```bash
+docker run --rm \
+  -e APOLLO_ELV2_LICENSE=accept \
+  -v "$PWD:/workspace" -w /workspace \
+  ghcr.io/apollographql/rover:1.0.1 \
+  plugin install
+```
+
+Otherwise, `rover supergraph compose` and `rover dev` download each plugin on every run, with a warning. For details, see [Automatic downloads](/rover/commands/plugin#automatic-downloads). The container runs as a non-root user, so the mounted directory must be writable by it.
+
+This is the recommended way to run Rover in CI on providers that support running steps inside a container image (CircleCI, Bitbucket Pipelines, GitLab CI/CD, Jenkins with a Docker agent, and so on). See the [CI/CD guide](./ci-cd) for end-to-end examples.
+
+### `npm` installer
+
+Rover is distributed on npm for integration with your JavaScript projects. Rover's Node dependency follows LTS versions where possible unless security concerns justify an earlier upgrade.
+
+<Caution>
+
+This installation method is provided for convenience in projects that are already in the Node ecosystem. Apollo does not recommend it otherwise, as it exposes your installation to npm's surface area of potential supply-chain attacks. Rover's npm installation script has been minimized to reduce that surface, but it still represents nonzero risk. For other use cases, prefer the [Linux/MacOS installer](#linux--macos-installer), the [Windows PowerShell installer](#windows-powershell-installer), or the [Docker image](#docker-image).
+
+</Caution>
+
+#### Installing from a mirror
+
+The `npm` package doesn't download anything when it's installed. The Rover binary for your platform comes from an npm package of its own, such as `@apollo/rover-aarch64-apple-darwin`, which npm installs as a dependency of `@apollo/rover`. To install from a private network, mirror these packages in your npm registry.
+
+Rover's plugins, such as `supergraph` and `router`, are downloaded from `https://rover.apollo.dev` when you install or first use them. To download them from a mirror instead, set the `APOLLO_ROVER_DOWNLOAD_HOST` environment variable or, in Rover v1.0 and later, pass `--download-host`. For the routes your mirror must serve, see [Using a plugin mirror](/rover/commands/plugin#using-a-plugin-mirror). This applies both to `rover plugin install` and to the [automatic downloads](/rover/commands/plugin#automatic-downloads) that `rover supergraph compose` and `rover dev` perform. If you've turned automatic downloads off, those commands use only plugins that are already installed, so install them ahead of time with `rover plugin install`.
+
+To resolve a floating version such as `latest` or `2`, Rover reads the `X-Version: vX.X.X` header from the mirror's response, so your mirror must pass it through. To avoid needing the header, install exact versions, such as `rover plugin install supergraph@=2.9.3`. With automatic downloads, pin the versions `rover dev` uses with the `APOLLO_ROVER_DEV_COMPOSITION_VERSION`, `APOLLO_ROVER_DEV_ROUTER_VERSION`, and `APOLLO_ROVER_DEV_MCP_VERSION` environment variables. For more details, see [versioning for `rover dev`](./commands/dev/#versioning).
+
+#### `devDependencies` install
+
+Run the following to install `rover` as one of your project's `devDependencies`:
+
+```bash
+npm install --save-dev @apollo/rover
+```
+
+You can then call `rover <parameters>` directly in your `package.json` [scripts](https://docs.npmjs.com/cli/v6/using-npm/scripts), or you can run `npx -p @apollo/rover rover <parameters>` in your project directory to execute commands.
+
+<Note>
+
+When using `npx`, the `-p @apollo/rover` argument is necessary to specify that the `@apollo/rover` package provides the `rover` command. See [`npx`'s documentation](https://www.npmjs.com/package/npx#description) for more information.
+
+</Note>
+
+<Caution>
+
+Running Rover directly via `npx` (without first installing it as a `devDependency`) bypasses lockfiles — including Rover's own — and is the highest-risk install path in terms of supply-chain exposure. Prefer installing `@apollo/rover` as a `devDependency` so the resolved version is captured in your project's lockfile.
+
+</Caution>
+
+#### Global install
+
+To install `rover` globally so you can use it from any directory on your machine, run the following:
+
+```bash
+npm install -g @apollo/rover
+```
+
+<Note>
+
+If you've installed `npm` without a version manager such as `nvm`, you might have trouble with global installs. If you encounter an `EACCES` permission-related error while trying to install globally, DO NOT run the install command with `sudo`. [This support page](https://docs.npmjs.com/resolving-eacces-permissions-errors-when-installing-packages-globally) has information that should help resolve this issue.
+
+</Note>
+
+### Binary download
+
+You can also [download the Rover binary for your operating system](https://github.com/apollographql/rover/releases) and manually add its location to your `PATH`.
+
+### Unofficial methods
+
+There are a few additional installation methods maintained by the community:
+
+1. [Homebrew](https://formulae.brew.sh/formula/rover#default)
+2. [Nix](https://search.nixos.org/packages?channel=unstable&show=rover&from=0&size=50&sort=relevance&type=packages&query=rover)
+
+## Next steps
+
+After installing Rover, you can set up shell completion for bash or zsh to enable tab completion for Rover commands. See the [completion command documentation](./commands/completion) for instructions.
+
+## Connecting to GraphOS
+
+After you install Rover, you should authenticate it with [GraphOS](/graphos/), because many of its commands communicate with GraphOS.
+
+Run the following command:
+
+```shell
+rover auth login
+```
+
+This command opens your browser so you can log in to GraphOS and authorize Rover. On a machine without a browser, such as over SSH, run `rover auth login --no-browser` instead. Rover prints a URL and a code to enter from any device. For more information, see the [`rover auth` commands](/rover/commands/auth).
+
+If you'd rather use a personal API key, run `rover config auth` instead. It tells you where to obtain a key and saves it to a configuration profile.
+
+Either way, Rover stores the credential in your operating system's keychain, where one is available. See [where Rover stores configuration](/rover/configuring#where-rover-stores-configuration).
+
+In CI and other automation, provide a credential with environment variables instead: `APOLLO_KEY` for an API key, or `APOLLO_CLIENT_ID` and `APOLLO_CLIENT_SECRET` for a client-credential pair. See [Choosing a credential](/rover/configuring#choosing-a-credential) and [Configuring Rover](./configuring).

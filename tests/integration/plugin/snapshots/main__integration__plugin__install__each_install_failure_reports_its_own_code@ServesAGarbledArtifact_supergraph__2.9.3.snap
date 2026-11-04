@@ -1,0 +1,21 @@
+---
+source: tests/integration/plugin/install.rs
+expression: json
+---
+{
+  "json_version": "1",
+  "data": {
+    "plugins": [],
+    "success": false
+  },
+  "error": {
+    "message": "Couldn't install the `supergraph` plugin v2.9.3 into `[home]/.rover/bin`.",
+    "causes": [
+      "Couldn't unpack the downloaded plugin archive",
+      "invalid gzip header"
+    ],
+    "code": "E050",
+    "plugin": "supergraph",
+    "requested_version": "=2.9.3"
+  }
+}

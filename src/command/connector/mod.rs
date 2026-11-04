@@ -1,0 +1,171 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::anyhow;
+use apollo_federation_types::config::{FederationVersion, SchemaSource};
+use camino::Utf8PathBuf;
+use clap::Parser;
+use rover_print::{print::Print, style::StyledText};
+use rover_studio::types::GraphRef;
+use semver::Version;
+use serde::Serialize;
+
+#[cfg(target_os = "macos")]
+use crate::command::connector::{analyze::AnalyzeCurl, generate::GenerateConnector};
+use crate::{
+    RoverOutput, RoverResult,
+    command::connector::{list::ListConnector, run::RunConnector, test::TestConnector},
+    composition::{
+        get_supergraph_binary,
+        pipeline::{CompositionPipeline, state::Run},
+        supergraph::config::lazy::LazilyResolvedSubgraph,
+    },
+    options::{PluginOpts, ProfileOpt},
+    plugin::error::RequestOrigin,
+    utils::{client::StudioClientConfig, parsers::FileDescriptorType},
+};
+
+#[cfg(target_os = "macos")]
+pub mod analyze;
+#[cfg(target_os = "macos")]
+pub mod generate;
+pub mod list;
+pub mod output;
+pub mod run;
+pub mod test;
+
+#[derive(Debug, Serialize, Parser)]
+pub struct Connector {
+    #[clap(subcommand)]
+    command: Command,
+
+    #[clap(flatten)]
+    pub plugin_opts: PluginOpts,
+
+    /// The version of Apollo Federation to use for composition. If no version is supplied, Rover
+    /// will use the latest 2.x version
+    #[arg(long = "federation-version", value_parser = crate::federation::parse_federation_version)]
+    pub federation_version: Option<FederationVersion>,
+
+    /// The relative path to the supergraph configuration file. You can pass `-` to use stdin instead of a file.
+    #[serde(skip_serializing)]
+    #[arg(long = "supergraph-config")]
+    pub supergraph_yaml: Option<FileDescriptorType>,
+
+    /// A [`GraphRef`] that is accessible in Apollo Studio.
+    /// This is used to initialize your supergraph with the values contained in this variant.
+    ///
+    /// This is analogous to providing a supergraph.yaml file with references to your graph variant in studio.
+    ///
+    /// If used in conjunction with `--config`, the values presented in the supergraph.yaml will take precedence over these values.
+    #[arg(long = "graph-ref")]
+    pub graph_ref: Option<GraphRef>,
+}
+
+#[derive(Debug, Parser, Serialize)]
+#[clap(about = "Work with Apollo Connectors")]
+pub enum Command {
+    #[cfg(target_os = "macos")]
+    /// Generate a schema with connectors from a collection of analyzed data
+    Generate(GenerateConnector),
+    #[cfg(target_os = "macos")]
+    /// Analyze one or more requests for use in generating
+    /// a Connector
+    Analyze(AnalyzeCurl),
+    /// Run a single connector
+    Run(RunConnector),
+    /// Run tests for one or more connectors
+    Test(TestConnector),
+    /// List all available connectors
+    List(ListConnector),
+}
+
+impl Connector {
+    /// The `supergraph` version this command was given, and where. The
+    /// precedence it then takes its place in is shared with every other
+    /// plugin-using command.
+    fn federation_version_override(&self) -> Option<(FederationVersion, RequestOrigin)> {
+        self.federation_version
+            .clone()
+            .map(|version| (version, RequestOrigin::Flag("--federation-version")))
+    }
+
+    pub(crate) async fn run(
+        &self,
+        override_install_path: Option<Utf8PathBuf>,
+        client_config: StudioClientConfig,
+        profile: &ProfileOpt,
+        stderr: &impl Print,
+    ) -> RoverResult<RoverOutput> {
+        use Command::*;
+
+        let supergraph_yaml = if let Some(supergraph_yaml) = &self.supergraph_yaml {
+            Some(supergraph_yaml.clone())
+        } else if Path::new("supergraph.yaml").exists() {
+            Some(FileDescriptorType::File("supergraph.yaml".into()))
+        } else {
+            None
+        };
+
+        let composition_pipeline = get_supergraph_binary(
+            self.federation_version_override(),
+            client_config,
+            override_install_path,
+            profile.clone(),
+            self.plugin_opts.clone(),
+            supergraph_yaml.clone(),
+            self.graph_ref.clone(),
+            false,
+        )
+        .await?;
+        let default_subgraph = default_subgraph(&supergraph_yaml, &composition_pipeline).await;
+        let supergraph_binary = composition_pipeline.state.supergraph_binary?;
+        stderr.print(&StyledText::plain(
+            supergraph_binary.provenance().to_string(),
+        ));
+        let minimum_version = Version::parse("2.12.0-preview.7")?;
+        let current_version = supergraph_binary.version();
+        if current_version < &minimum_version {
+            return Err(anyhow!(
+                "You must use federation {minimum_version} or greater with `rover connectors` commands. \
+                Your current version is {current_version}. \
+                Update your `supergraph.yaml` or use --federation-version to specify a compatible version.",
+            ).into());
+        }
+
+        match &self.command {
+            #[cfg(target_os = "macos")]
+            Generate(command) => command.run(supergraph_binary).await,
+            Test(command) => command.run(supergraph_binary, default_subgraph).await,
+            Run(command) => command.run(supergraph_binary, default_subgraph).await,
+            List(command) => command.run(supergraph_binary, default_subgraph).await,
+            #[cfg(target_os = "macos")]
+            Analyze(command) => command.run(supergraph_binary).await,
+        }
+    }
+}
+
+async fn default_subgraph(
+    supergraph_yaml: &Option<FileDescriptorType>,
+    composition_pipeline: &CompositionPipeline<Run>,
+) -> Option<PathBuf> {
+    let Some(FileDescriptorType::File(supergraph_yaml_path)) = supergraph_yaml else {
+        return None;
+    };
+    let (supergraph, _) = composition_pipeline
+        .state
+        .resolver
+        .lazily_resolve_subgraphs(&supergraph_yaml_path.parent()?.to_path_buf())
+        .await
+        .ok()?;
+    if supergraph.subgraphs().len() == 1
+        && let Some(SchemaSource::File { file }) = supergraph
+            .subgraphs()
+            .values()
+            .next()
+            .map(LazilyResolvedSubgraph::schema)
+    {
+        Some(supergraph_yaml_path.as_std_path().join(file))
+    } else {
+        None
+    }
+}

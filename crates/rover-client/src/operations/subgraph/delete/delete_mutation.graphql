@@ -1,0 +1,18 @@
+mutation SubgraphDeleteMutation(
+  $graph_id: ID!
+  $variant: String!
+  $subgraph: String!
+) {
+  graph(id: $graph_id) {
+    removeImplementingServiceAndTriggerComposition(
+      graphVariant: $variant
+      name: $subgraph
+    ) {
+      errors {
+        message
+        code
+      }
+      updatedGateway
+    }
+  }
+}

@@ -1,0 +1,83 @@
+query GraphCheckWorkflowQuery($graph_id: ID!, $workflow_id: ID!) {
+  graph(id: $graph_id) {
+    checkWorkflow(id: $workflow_id) {
+      status
+      tasks {
+        __typename
+        status
+        targetURL
+        ... on OperationsCheckTask {
+          result {
+            changes {
+              severity
+              code
+              description
+            }
+            numberOfCheckedOperations
+          }
+        }
+        ... on LintCheckTask {
+          result {
+            diagnostics {
+              level
+              message
+              coordinate
+              rule
+              sourceLocations {
+                start {
+                  byteOffset
+                  column
+                  line
+                }
+                end {
+                  byteOffset
+                  column
+                  line
+                }
+              }
+            }
+            stats {
+              errorsCount
+              warningsCount
+            }
+          }
+        }
+        ... on CustomCheckTask {
+          result {
+            violations {
+              coordinate
+              level
+              message
+              rule
+              sourceLocations {
+                start {
+                  byteOffset
+                  column
+                  line
+                }
+                end {
+                  byteOffset
+                  column
+                  line
+                }
+                subgraphName
+              }
+            }
+          }
+        }
+        ... on DownstreamCheckTask {
+          results {
+            __typename
+            blocking
+            downstreamGraphID
+            downstreamVariantName
+            downstreamWorkflow {
+              status
+            }
+            failsUpstreamWorkflow
+          }
+        }
+      }
+    }
+  }
+}

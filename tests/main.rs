@@ -1,0 +1,15 @@
+use assert_cmd::cargo::cargo_bin_cmd;
+use predicates::prelude::*;
+mod integration;
+mod support;
+
+#[test]
+fn its_executable() {
+    let mut cmd = cargo_bin_cmd!("rover");
+
+    // running the CLI with no command returns the help message to stderr
+    let result = cmd.assert();
+
+    // let's make sure the help message includes the word "Rover"
+    result.stderr(predicate::str::contains("Rover"));
+}
